@@ -17,7 +17,6 @@ GHOSTWRITER_API_KEY = os.environ["GHOSTWRITER_API_KEY"]
 GHOSTWRITER_URL = os.environ["GHOSTWRITER_URL"]
 GHOSTWRITER_OPLOG_ID = os.environ["GHOSTWRITER_OPLOG_ID"]
 REDIS_HOSTNAME =os.environ["REDIS_HOSTNAME"]
-AUTH = {}
 
 rconn = redis.Redis(host=REDIS_HOSTNAME, port=6379, db=0)
 headers = {'Authorization': f"Api-Key {GHOSTWRITER_API_KEY}", "Content-Type": "application/json"}
