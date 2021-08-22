@@ -9,6 +9,7 @@ from datetime import datetime
 from mythic import *
 from sys import exit
 
+MYTHIC_API_KEY = os.environ.get("MYTHIC_API_KEY")
 MYTHIC_USERNAME = os.environ["MYTHIC_USERNAME"]
 MYTHIC_PASSWORD = os.environ["MYTHIC_PASSWORD"]
 MYTHIC_IP = os.environ["MYTHIC_IP"]
@@ -152,11 +153,17 @@ async def handle_response(token, data):
         print(f"[!] Error updating ghostwriter entry: {response.status_code}")
 
 async def scripting():
-    mythic = mythic_rest.Mythic(username=MYTHIC_USERNAME, password=MYTHIC_PASSWORD,
-                    server_ip=MYTHIC_IP, server_port="7443", ssl=True, global_timeout=-1)
+    if len(MYTHIC_API_KEY) == 0:
+        mythic = mythic_rest.Mythic(username=MYTHIC_USERNAME,
+            password=MYTHIC_PASSWORD, server_ip=MYTHIC_IP, server_port="7443",
+            ssl=True, global_timeout=-1)
 
-    await mythic.login()
-    resp = await mythic.set_or_create_apitoken()
+        await mythic.login()
+        await mythic.set_or_create_apitoken()
+    else:
+        mythic = mythic_rest.Mythic(apitoken=MYTHIC_API_KEY,
+            server_ip=MYTHIC_IP, server_port="7443", ssl=True,
+            global_timeout=-1)
 
     await mythic.listen_for_all_tasks(handle_task)
     await mythic.listen_for_all_responses(handle_response)
