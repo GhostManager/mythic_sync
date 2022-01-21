@@ -281,10 +281,10 @@ async def listen_for_all_responses_exception_handler(mythic: mythic_rest.Mythic,
 async def scripting():
     await wait_for_redis()
     print_flush(f"[+] Successfully connected to Redis")
-    keys = rconn.keys("*")
-    for k in keys:
-        rconn.delete(k)
-    await wait_for_service()
+    #keys = rconn.keys("*")
+    #for k in keys:
+    #    rconn.delete(k)
+    #await wait_for_service()
     print_flush(f'[+] Successfully connected to {MYTHIC_URL}')
     print_flush(f"[*] Trying to authenticate to Mythic")
     mythic = await wait_for_authentication()
