@@ -5,18 +5,36 @@ mythic_sync is a standalone tool that will connect to a [Mythic](https://github.
 This enables automatic logging of every operator's Mythic commands, comments, and output into Ghostwriter so operators can focus more on technical execution and less on manual and tedious logging and reporting activities.
 
 ## Usage
-### Execute w/ Docker (Option 1)
 
+### Execute via Mythic 2.3+ and mythic-cli
+0. On your Mythic server, run `sudo ./mythic-cli mythic_sync install github`
+```bash
+sudo ./mythic-cli mythic_sync install github
+[*] Creating temporary directory
+[*] Cloning https://github.com/GhostManager/mythic_sync
+Cloning into '/opt/Mythic/tmp'...
+Please enter your GhostWriter API Key: f7D2nMPz.v8V5ioCNsSSoO19wNnBZsDhhZNmzzwNE
+Please enter your GhostWriter URL: https://ghostwriter.domain.com
+Please enter your GhostWriter OpLog ID: 12
+Please enter your Mythic API Key (optional): 
+[+] Added mythic_sync to docker-compose
+[+] Successfully installed mythic_sync!
+[+] Successfully updated configuration in .env
+```
+
+
+### Execute via stand alone Docker
 0. After checking out the repository, open the `settings.env` file and fill out the variables with appropriate values. The following is an example:
 
 ``` text
 MYTHIC_IP=10.10.1.100
-MYTHIC_USERNAME=apfell_user
+MYTHIC_USERNAME=mythic_admin
 MYTHIC_PASSWORD=SuperSecretPassword
 GHOSTWRITER_API_KEY=f7D2nMPz.v8V5ioCNsSSoO19wNnBZsDhhZNmzzwNE
 GHOSTWRITER_URL=https://ghostwriter.mydomain.com
 GHOSTWRITER_OPLOG_ID=123
 REDIS_HOSTNAME=redis
+REDIS_PORT=6379
 ```
 
 1. Once the environment variables are setup, you can launch the service by using docker-compose:
@@ -25,31 +43,6 @@ REDIS_HOSTNAME=redis
 docker-compose up
 ```
 
-### Execute w/out Docker (Option 2)
-
-0. After checking out the repository, open the `settings.sh` file and fill out the variables with appropriate values.
-
-1. Install python virtual environments for python3 and redis
-
-``` bash
-apt install python3-venv redis
-```
-
-2. Create a new tmux session and virtual environment for mythic_sync and install required modules
-
-``` bash
-tmux
-python3 -m venv .
-source bin/activate
-pip install -r requirements.txt
-```
-
-3. Set the environment variables and then run `sync.py` (ideally in a named Tmux session, `tmux new -s mythic_sync`)
-
-``` bash
-source ./settings.sh
-python sync.py
-```
 
 ### Verify Successful Start Up
 
@@ -57,13 +50,13 @@ python sync.py
 
     > Initial entry from mythic_sync at: <server_ip>. If you're seeing this then oplog syncing is working for this C2 server!
 
-2. If so, you're all set! Otherwise, see "Troubleshooting"
+2. If so, you're all set! Otherwise, check the logs from the docker container for error messages. This can be done via `sudo docker logs mythic_sync`.
 
 ## Troubleshooting
 
 Ensure the host where mythic_sync is running has network access to the Ghostwriter and Mythic servers.
 
-mythic_sync uses an internal redis database to sync what events have already been sent to Ghostwriter, avoiding duplicates. If you want to re-sync, you will need to delete the volume and run it again.
+mythic_sync uses an internal redis database to sync what events have already been sent to Ghostwriter, avoiding duplicates.
 
 If the mythic_sync service goes down, it is safe to stand it back up and avoid duplicates as long as the redis container wasn't force killed.
 
