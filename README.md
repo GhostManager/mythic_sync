@@ -8,18 +8,30 @@ The current version of `mythic_sync` requires Ghostwriter v3.0.1 or higher.
 
 ## Usage
 
+### Getting Started
+
+To authenticate to your instances of Mythic and Ghostwriter, you will need this information handy:
+
+* Ghostwriter URL
+* Ghostwriter GraphQL API token
+* Ghostwriter oplog ID
+* Mythic credentials
+
+#### Ghostwriter API Token & Oplog
+
+You can get your oplog's ID by opening the oplog's webpage and looking at the top of the page. You'll see "Oplog ID #" followed by a number. That's the ID number you need.
+
+To generate an API token for your Ghostwriter instance, visit your user profile and click on the "Create" button in the "API Tokens" section.
+
+The token must be attached to an account that has access to the project containing your target oplog. You can read more about the [authorization controls on the Ghostwriter wiki](https://www.ghostwriter.wiki/features/graphql-api/authorization).
+
 ### Execute via Mythic 2.3+ and `mythic-cli`
 
 For the easiest experience with `mythic_sync`, install it via the `mythic-cli` tool. When installed this way, the `mythic_sync` service will become part of your Mythic deployment. You can then use `mythic-cli` to manage `mythic_sync` (just like Mythic) and and the service will come up and go down alongside your other Mythic services.
 
 On your Mythic server, run: `sudo ./mythic-cli mythic_sync install github https://github.com/GhostManager/mythic_sync`
 
-Follow the prompts to configure `mythic_sync` to authenticate to your instances of Mythic and Ghostwriter. You will need this information handy:
-
-* Ghostwriter API token
-* Ghostwriter URL
-* Ghostwriter oplog ID
-* Mythic credentials
+Follow the prompts to configure `mythic_sync` with your Mythic and Ghotwriter server cofniguration.
 
 You can get your Ghostwriter Oplog ID by visiting your log in your web browser and looking at the top of the page or the URL. A URL with `/oplog/12/entries` means your Oplog ID is `12`.
 
