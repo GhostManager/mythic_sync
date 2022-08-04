@@ -13,7 +13,7 @@ import redis
 # Mythic Sync Libraries
 from mythic import mythic, mythic_classes
 
-logging.basicConfig(format="%(levelname)s:%(message)s")
+logging.basicConfig(format="%(levelname)s %(asctime)s %(message)s")
 mythic_sync_log = logging.getLogger("mythic_sync_logger")
 mythic_sync_log.setLevel(logging.DEBUG)
 
