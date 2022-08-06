@@ -1,3 +1,4 @@
 aiohttp
 redis==3.5.3
-mythic==0.0.36
+mythic==0.0.37
+gql==3.4.0
