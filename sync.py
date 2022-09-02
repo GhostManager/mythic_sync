@@ -18,6 +18,8 @@ from graphql.error.graphql_error import GraphQLError
 # Mythic Sync Libraries
 from mythic import mythic, mythic_classes
 
+VERSION = "2.0.2"
+
 # Logging configuration
 # Level applies to all loggers, including ``gql`` Transport and Client loggers
 # Using a level below ``WARNING`` may make logs difficult to read
@@ -168,7 +170,7 @@ class MythicSync:
 
     # GraphQL transport configuration
     GRAPHQL_URL = GHOSTWRITER_URL.rstrip("/") + "/v1/graphql"
-    headers = {"Authorization": f"Bearer {GHOSTWRITER_API_KEY}", "Content-Type": "application/json"}
+    headers = {"User-Agent": f"Mythic_Sync/{VERSION}", "Authorization": f"Bearer {GHOSTWRITER_API_KEY}", "Content-Type": "application/json"}
     transport = AIOHTTPTransport(url=GRAPHQL_URL, timeout=10, headers=headers)
 
     def __init__(self):
