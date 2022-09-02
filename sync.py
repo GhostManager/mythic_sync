@@ -298,7 +298,7 @@ async def wait_for_authentication() -> mythic_classes.Mythic:
                     server_ip=MYTHIC_IP,
                     server_port=MYTHIC_PORT,
                     ssl=True,
-                    global_timeout=-1,
+                    timeout=-1,
                 )
                 await mythic.get_me(mythic=mythic_instance)
             except Exception as e:
