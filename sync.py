@@ -170,7 +170,11 @@ class MythicSync:
 
     # GraphQL transport configuration
     GRAPHQL_URL = GHOSTWRITER_URL.rstrip("/") + "/v1/graphql"
-    headers = {"User-Agent": f"Mythic_Sync/{VERSION}", "Authorization": f"Bearer {GHOSTWRITER_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "User-Agent": f"Mythic_Sync/{VERSION}",
+        "Authorization": f"Bearer {GHOSTWRITER_API_KEY}",
+        "Content-Type": "application/json"
+    }
     transport = AIOHTTPTransport(url=GRAPHQL_URL, timeout=10, headers=headers)
 
     def __init__(self):
@@ -269,7 +273,6 @@ class MythicSync:
             mythic_sync_log.exception("Encountered an exception while processing Mythic's message into a message for Ghostwriter")
         return gw_message
 
-
     async def _mythic_callback_to_ghostwriter_message(self, message: dict) -> dict:
         """
         Converts a Mythic callback event to the fields expected by Ghostwriter's GraphQL API and ``OplogEntry`` model.
@@ -285,8 +288,8 @@ class MythicSync:
             gw_message["startDate"] = callback_date.strftime("%Y-%m-%d %H:%M:%S")
             gw_message["output"] = f"New Callback {message['id']}"
             integrity = self.integrity_levels[message["integrity_level"]]
-            os = message['os'].replace("\n", " ")
-            gw_message["comments"] = f"Integrity Level: {integrity}\nProcess: {message['process_name']} (pid {message['pid']})\nOS: {os}"
+            opsys = message['os'].replace("\n", " ")
+            gw_message["comments"] = f"Integrity Level: {integrity}\nProcess: {message['process_name']} (pid {message['pid']})\nOS: {opsys}"
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
             gw_message["sourceIp"] = f"{message['host']} ({message['ip']})"
             gw_message["userContext"] = message["user"]
@@ -294,10 +297,10 @@ class MythicSync:
             gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
         except Exception:
             mythic_sync_log.exception(
-                "Encountered an exception while processing Mythic's message into a message for Ghostwriter! Received message: %s", message
+                "Encountered an exception while processing Mythic's message into a message for Ghostwriter! Received message: %s",
+                message
             )
         return gw_message
-
 
     async def _create_entry(self, message: dict) -> None:
         """
@@ -310,6 +313,7 @@ class MythicSync:
             Dictionary produced by ``_mythic_task_to_ghostwriter_message()`` or ``_mythic_callback_to_ghostwriter_message()``
         """
         entry_id = ""
+        gw_message = {}
         if "agent_task_id" in message:
             entry_id = message["agent_task_id"]
             mythic_sync_log.debug(f"Adding task: {message['agent_task_id']}")
@@ -320,7 +324,8 @@ class MythicSync:
             gw_message = await self._mythic_callback_to_ghostwriter_message(message)
         else:
             mythic_sync_log.error(
-                "Failed to create an entry for task, no `agent_task_id` or `agent_callback_id` found! Message contents: %s", message
+                "Failed to create an entry for task, no `agent_task_id` or `agent_callback_id` found! Message "
+                "contents: %s", message
             )
 
         if entry_id:
@@ -356,15 +361,17 @@ class MythicSync:
         try:
             result = await self._execute_query(self.update_query, gw_message)
             if not result or "update_oplogEntry" not in result:
-                mythic_sync_log.info("Did not receive a response with data from Ghostwriter's GraphQL API! Response: %s", result)
+                mythic_sync_log.info(
+                    "Did not receive a response with data from Ghostwriter's GraphQL API! Response: %s",
+                    result
+                )
         except Exception:
             mythic_sync_log.exception("Exception encountered while trying to update task log entry in Ghostwriter!")
-
 
     async def handle_task(self) -> None:
         """
         Start a subscription for Mythic tasks and handle them. Send new tasks to Ghostwriter
-        with ``_create_entry()`` or send updates for existign tasks with ``_update_entry()``.
+        with ``_create_entry()`` or send updates for existing tasks with ``_update_entry()``.
         """
         custom_return_attributes = """
         agent_task_id
@@ -441,11 +448,13 @@ class MythicSync:
             async with aiohttp.ClientSession() as session:
                 async with session.get(self.MYTHIC_URL, ssl=False) as resp:
                     if resp.status != 200:
-                        mythic_sync_log.warning("Expected 200 OK and received HTTP code %s while trying to connect to Mythic, trying again in %s seconds...", resp.status, self.wait_timeout)
+                        mythic_sync_log.warning(
+                            "Expected 200 OK and received HTTP code %s while trying to connect to Mythic, trying again in %s seconds...",
+                            resp.status, self.wait_timeout
+                        )
                         await asyncio.sleep(self.wait_timeout)
                         continue
             return
-
 
     async def _wait_for_redis(self) -> None:
         """Wait for a connection to be established with Mythic's Redis container."""
@@ -528,6 +537,8 @@ async def scripting():
                 mythic_sync.handle_callback(),
             )
         except Exception:
-            mythic_sync_log.exception("Encountered an exception while subscribing to tasks and responses, restarting...")
+            mythic_sync_log.exception(
+                "Encountered an exception while subscribing to tasks and responses, restarting..."
+            )
 
 asyncio.run(scripting())
