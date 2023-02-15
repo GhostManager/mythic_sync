@@ -122,6 +122,15 @@ class MythicSync:
         """
     )
 
+    # This mutation is not a ``gql`` object because it's used with Mythic's ``execute_custom_query``
+    mythic_notification_query = """
+        mutation createEventLog($message: String!, $level: String!){
+            insert_operationeventlog_one(object: {level: $level, message: $message}) {
+                id
+            }
+        }
+    """
+
     # Mythic authentication
     MYTHIC_API_KEY = os.environ.get("MYTHIC_API_KEY") or ""
     MYTHIC_USERNAME = os.environ.get("MYTHIC_USERNAME") or ""
@@ -216,15 +225,20 @@ class MythicSync:
                         result = await session.execute(query, variable_values=variable_values)
                         mythic_sync_log.debug("Successfully executed query with result: %s", result)
                     except TimeoutError:
-                        mythic_sync_log.error("Timeout occurred while trying to connect to Ghostwriter at %s", self.GHOSTWRITER_URL)
+                        mythic_sync_log.error(
+                            "Timeout occurred while trying to connect to Ghostwriter at %s",
+                            self.GHOSTWRITER_URL
+                        )
                     except TransportQueryError as e:
                         mythic_sync_log.error("Error encountered while fetching GrpahQL schema: %s", e)
                     except GraphQLError as e:
                         mythic_sync_log.error("Error with GraphQL query: %s", e)
             except Exception:
                 mythic_sync_log.exception(
-                    "Exception occurred while trying to post the query to Ghostwriter! Trying again in %s seconds...", self.wait_timeout
+                    "Exception occurred while trying to post the query to Ghostwriter! Trying again in %s seconds...",
+                    self.wait_timeout
                 )
+                await self._post_error_notification()
                 await asyncio.sleep(self.wait_timeout)
                 continue
             return result
@@ -234,12 +248,37 @@ class MythicSync:
         mythic_sync_log.info("Sending the initial Ghostwriter log entry")
         variable_values = {
             "oplogId": self.GHOSTWRITER_OPLOG_ID,
-            "description": f"Initial entry from mythic_sync at: {self.MYTHIC_IP}. If you're seeing this then oplog syncing is working for this C2 server!",
+            "description": f"Initial entry from mythic_sync at: {self.MYTHIC_IP}. If you're seeing this then oplog "
+                           f"syncing is working for this C2 server!",
             "server": f"Mythic Server ({self.MYTHIC_IP})",
         }
         await self._execute_query(self.initial_query, variable_values)
+        await mythic.execute_custom_query(
+            mythic=self.mythic_instance,
+            query=self.mythic_notification_query,
+            variables={
+                "message": "Mythic Sync successfully posted its initial log entry to Ghostwriter",
+                "level": "info"
+            },
+        )
         return
 
+    async def _post_error_notification(self, message: str = None) -> None:
+        """Send an error notification to Mythic's notification center."""
+        if message is None:
+            message = "Mythic Sync logged an error and may need attention to continue syncing.\n" \
+                      "Run this command to review the issue:\n\n" \
+                      "  sudo ./mythic-cli logs mythic_sync"
+        mythic_sync_log.info("Submitting an error notification to Mythic's notification center")
+        await mythic.execute_custom_query(
+            mythic=self.mythic_instance,
+            query=self.mythic_notification_query,
+            variables={
+                "message": message,
+                "level": "warning"
+            },
+        )
+        return
 
     async def _mythic_task_to_ghostwriter_message(self, message: dict) -> dict:
         """
@@ -336,12 +375,16 @@ class MythicSync:
                     # JSON response example: `{'data': {'insert_oplogEntry': {'returning': [{'id': 192}]}}}`
                     rconn.set(entry_id, result["insert_oplogEntry"]["returning"][0]["id"])
                 else:
-                    mythic_sync_log.info("Did not receive a response with data from Ghostwriter's GraphQL API! Response: %s", result)
+                    mythic_sync_log.info(
+                        "Did not receive a response with data from Ghostwriter's GraphQL API! Response: %s",
+                        result
+                    )
             except Exception:
                 mythic_sync_log.exception(
-                    "Encountered an exception while trying to create a new log entry! Response from Ghostwriter: %s", result,
+                    "Encountered an exception while trying to create a new log entry! Response from Ghostwriter: %s",
+                    result,
                 )
-
+                await self._post_error_notification()
 
     async def _update_entry(self, message: dict, entry_id: str) -> None:
         """
@@ -397,17 +440,22 @@ class MythicSync:
         }
         """
         mythic_sync_log.info("Starting subscription for tasks")
-        async for data in mythic.subscribe_all_tasks_and_updates(mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes):
+        async for data in mythic.subscribe_all_tasks_and_updates(
+                mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes
+        ):
             try:
                 entry_id = rconn.get(data["agent_task_id"])
             except Exception:
-                mythic_sync_log.exception("Encountered an exception while connecting to Redis to fetch data! Data returned by Mythic: %s", data)
+                mythic_sync_log.exception(
+                    "Encountered an exception while connecting to Redis to fetch data! Data returned by Mythic: %s",
+                    data
+                )
+                await self._post_error_notification()
                 continue
             if entry_id is not None:
                 await self._update_entry(data, entry_id.decode())
             else:
                 await self._create_entry(data)
-
 
     async def handle_callback(self) -> None:
         """
@@ -437,9 +485,10 @@ class MythicSync:
         }
         """
         mythic_sync_log.info("Starting subscription for callbacks")
-        async for data in mythic.subscribe_new_callbacks(mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes):
+        async for data in mythic.subscribe_new_callbacks(
+                mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes
+        ):
             await self._create_entry(data)
-
 
     async def _wait_for_service(self) -> None:
         """Wait for an HTTP session to be established with Mythic."""
@@ -468,9 +517,9 @@ class MythicSync:
                     "Encountered an exception while trying to connect to Redis, %s:%s, trying again in %s seconds...",
                     self.REDIS_HOSTNAME, self.REDIS_PORT, self.wait_timeout
                 )
+                await self._post_error_notification()
                 await asyncio.sleep(self.wait_timeout)
                 continue
-
 
     async def __wait_for_authentication(self) -> mythic_classes.Mythic:
         """Wait for authentication with Mythic to complete."""
@@ -478,7 +527,9 @@ class MythicSync:
             # If ``MYTHIC_API_KEY`` is not set in the environment, then authenticate with user credentials
             if len(self.MYTHIC_API_KEY) == 0:
                 mythic_sync_log.info(
-                    "Authenticating to Mythic, https://%s:%s, with username and password", self.MYTHIC_IP, self.MYTHIC_PORT)
+                    "Authenticating to Mythic, https://%s:%s, with username and password",
+                    self.MYTHIC_IP, self.MYTHIC_PORT
+                )
                 try:
                     mythic_instance = await mythic.login(
                         username=self.MYTHIC_USERNAME,
@@ -492,6 +543,9 @@ class MythicSync:
                         "Encountered an exception while trying to authenticate to Mythic, trying again in %s seconds...",
                         self.wait_timeout
                     )
+                    await self._post_error_notification(
+                        message="Mythic Sync encountered an exception while trying to authenticate to Mythic"
+                    )
                     await asyncio.sleep(self.wait_timeout)
                     continue
                 try:
@@ -501,13 +555,18 @@ class MythicSync:
                         "Encountered an exception while trying to authenticate to Mythic, trying again in %s seconds...",
                         self.wait_timeout
                     )
+                    await self._post_error_notification(
+                        message="Mythic Sync encountered an exception while trying to authenticate to Mythic")
                     await asyncio.sleep(self.wait_timeout)
                     continue
             elif self.MYTHIC_USERNAME == "" and self.MYTHIC_PASSWORD == "":
                 mythic_sync_log.error("You must supply a MYTHIC_USERNAME and MYTHIC_PASSWORD")
                 sys.exit(1)
             else:
-                mythic_sync_log.info("Authenticating to Mythic, https://%s:%s, with a specified API Key", self.MYTHIC_IP, self.MYTHIC_PORT)
+                mythic_sync_log.info(
+                    "Authenticating to Mythic, https://%s:%s, with a specified API Key",
+                    self.MYTHIC_IP, self.MYTHIC_PORT
+                )
                 try:
                     mythic_instance = await mythic.login(
                         apitoken=self.MYTHIC_API_KEY,
@@ -520,6 +579,9 @@ class MythicSync:
                     mythic_sync_log.exception(
                         "Failed to authenticate with the Mythic API token, trying again in %s seconds...",
                         self.wait_timeout
+                    )
+                    await self._post_error_notification(
+                        message="Mythic Sync encountered an exception while trying to authenticate to Mythic"
                     )
                     await asyncio.sleep(self.wait_timeout)
                     continue
