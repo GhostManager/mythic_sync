@@ -10,6 +10,7 @@ from datetime import datetime
 import aiohttp
 import redis
 from gql import Client, gql
+from gql.client import DocumentNode
 from gql.transport.aiohttp import AIOHTTPTransport
 from gql.transport.exceptions import TransportQueryError
 from graphql.error.graphql_error import GraphQLError
@@ -192,7 +193,7 @@ class MythicSync:
 
         await self._create_initial_entry()
 
-    async def _execute_query(self, query: str, variable_values: dict) -> dict:
+    async def _execute_query(self, query: DocumentNode, variable_values: dict) -> dict:
         """
         Execute a GraphQL query against the Ghostwriter server.
 
