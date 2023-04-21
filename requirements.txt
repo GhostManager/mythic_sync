@@ -1,4 +1,4 @@
 aiohttp==3.8.4
-redis==4.5.4
-mythic==0.1.0rc7
+redis==4.5.1
+mythic==0.0.38
 gql==3.4.0
