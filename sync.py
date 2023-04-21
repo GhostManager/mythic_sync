@@ -122,15 +122,6 @@ class MythicSync:
         """
     )
 
-    # This mutation is not a ``gql`` object because it's used with Mythic's ``execute_custom_query``
-    mythic_notification_query = """
-        mutation createEventLog($message: String!, $level: String!){
-            insert_operationeventlog_one(object: {level: $level, message: $message}) {
-                id
-            }
-        }
-    """
-
     # Mythic authentication
     MYTHIC_API_KEY = os.environ.get("MYTHIC_API_KEY") or ""
     MYTHIC_USERNAME = os.environ.get("MYTHIC_USERNAME") or ""
@@ -215,7 +206,7 @@ class MythicSync:
         result = {}
         while True:
             try:
-                async with Client(transport=self.transport, fetch_schema_from_transport=True, ) as session:
+                async with Client(transport=self.transport, fetch_schema_from_transport=False, ) as session:
                     try:
                         result = await session.execute(query, variable_values=variable_values)
                         mythic_sync_log.debug("Successfully executed query with result: %s", result)
@@ -248,14 +239,10 @@ class MythicSync:
             "server": f"Mythic Server ({self.MYTHIC_IP})",
         }
         await self._execute_query(self.initial_query, variable_values)
-        await mythic.execute_custom_query(
-            mythic=self.mythic_instance,
-            query=self.mythic_notification_query,
-            variables={
-                "message": "Mythic Sync successfully posted its initial log entry to Ghostwriter",
-                "level": "info"
-            },
-        )
+        await mythic.send_event_log_message(mythic=self.mythic_instance,
+                                            message="Mythic Sync successfully posted its initial log entry to Ghostwriter",
+                                            source="mythic_sync",
+                                            level="info")
         return
 
     async def _post_error_notification(self, message: str = None) -> None:
@@ -265,14 +252,10 @@ class MythicSync:
                       "Run this command to review the issue:\n\n" \
                       "  sudo ./mythic-cli logs mythic_sync"
         mythic_sync_log.info("Submitting an error notification to Mythic's notification center")
-        await mythic.execute_custom_query(
-            mythic=self.mythic_instance,
-            query=self.mythic_notification_query,
-            variables={
-                "message": message,
-                "level": "warning"
-            },
-        )
+        await mythic.send_event_log_message(mythic=self.mythic_instance,
+                                            message=message,
+                                            source="mythic_sync",
+                                            level="warning")
         return
 
     async def _mythic_task_to_ghostwriter_message(self, message: dict) -> dict:
