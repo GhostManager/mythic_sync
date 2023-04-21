@@ -5,6 +5,8 @@ import os
 import sys
 from asyncio.exceptions import TimeoutError
 from datetime import datetime
+import json
+import ipaddress
 
 # 3rd Party Libraries
 import aiohttp
@@ -18,7 +20,7 @@ from graphql.error.graphql_error import GraphQLError
 # Mythic Sync Libraries
 from mythic import mythic, mythic_classes
 
-VERSION = "2.0.2"
+VERSION = "2.1.0"
 
 # Logging configuration
 # Level applies to all loggers, including ``gql`` Transport and Client loggers
@@ -122,15 +124,6 @@ class MythicSync:
         """
     )
 
-    # This mutation is not a ``gql`` object because it's used with Mythic's ``execute_custom_query``
-    mythic_notification_query = """
-        mutation createEventLog($message: String!, $level: String!){
-            insert_operationeventlog_one(object: {level: $level, message: $message}) {
-                id
-            }
-        }
-    """
-
     # Mythic authentication
     MYTHIC_API_KEY = os.environ.get("MYTHIC_API_KEY") or ""
     MYTHIC_USERNAME = os.environ.get("MYTHIC_USERNAME") or ""
@@ -146,19 +139,14 @@ class MythicSync:
     if MYTHIC_PORT is None:
         mythic_sync_log.error("MYTHIC_PORT must be supplied!")
         sys.exit(1)
+    else:
+        MYTHIC_PORT = int(MYTHIC_PORT)
 
     MYTHIC_URL = f"https://{MYTHIC_IP}:{MYTHIC_PORT}"
 
-    # Mythic's Redis server
-    REDIS_HOSTNAME = os.environ.get("REDIS_HOSTNAME")
-    if REDIS_HOSTNAME is None:
-        mythic_sync_log.error("REDIS_HOSTNAME must be supplied!")
-        sys.exit(1)
-
-    REDIS_PORT = os.environ.get("REDIS_PORT")
-    if REDIS_PORT is None:
-        mythic_sync_log.error("REDIS_PORT must be supplied!")
-        sys.exit(1)
+    # Redis server
+    REDIS_HOSTNAME = "127.0.0.1"
+    REDIS_PORT = 6379
 
     # Ghostwriter server authentication
     GHOSTWRITER_API_KEY = os.environ.get("GHOSTWRITER_API_KEY")
@@ -206,6 +194,16 @@ class MythicSync:
 
         await self._create_initial_entry()
 
+    async def _get_sorted_ips(self, ip: str) -> list[str]:
+        source_ips = json.loads(ip)
+        source_ips = [x for x in source_ips if x != ""]
+
+        for i in range(len(source_ips)):
+            source_ips[i] = ipaddress.ip_address(source_ips[i])
+        source_ips = [str(x) for x in sorted(source_ips)]
+        source_ip = json.dumps(source_ips)
+        return source_ip
+
     async def _execute_query(self, query: DocumentNode, variable_values: dict) -> dict:
         """
         Execute a GraphQL query against the Ghostwriter server.
@@ -217,31 +215,39 @@ class MythicSync:
         ``variable_values``
             The parameters to pass to the query
         """
-        result = {}
         while True:
             try:
-                async with Client(transport=self.transport, fetch_schema_from_transport=True, ) as session:
+                async with Client(transport=self.transport, fetch_schema_from_transport=False, ) as session:
                     try:
                         result = await session.execute(query, variable_values=variable_values)
                         mythic_sync_log.debug("Successfully executed query with result: %s", result)
+                        return result
                     except TimeoutError:
                         mythic_sync_log.error(
                             "Timeout occurred while trying to connect to Ghostwriter at %s",
                             self.GHOSTWRITER_URL
                         )
+                        await self._post_error_notification(f"MythicSync:\nTimeout occurred while trying to connect to Ghostwriter at {self.GHOSTWRITER_URL}",)
+                        await asyncio.sleep(self.wait_timeout)
+                        continue
                     except TransportQueryError as e:
-                        mythic_sync_log.error("Error encountered while fetching GrpahQL schema: %s", e)
+                        mythic_sync_log.exception("Error encountered while fetching GrpahQL schema: %s", e)
+                        await self._post_error_notification(f"MythicSync:\nError encountered while fetching GrpahQL schema: {e}")
+                        await asyncio.sleep(self.wait_timeout)
+                        continue
                     except GraphQLError as e:
-                        mythic_sync_log.error("Error with GraphQL query: %s", e)
-            except Exception:
+                        mythic_sync_log.exception("Error with GraphQL query: %s", e)
+                        await self._post_error_notification(f"MythicSync:\nError with GraphQL query: {e}")
+                        await asyncio.sleep(self.wait_timeout)
+                        continue
+            except Exception as exc:
                 mythic_sync_log.exception(
                     "Exception occurred while trying to post the query to Ghostwriter! Trying again in %s seconds...",
                     self.wait_timeout
                 )
-                await self._post_error_notification()
+                await self._post_error_notification(f"MythicSync:\nException occurred while trying to post the query to Ghostwriter!\n{exc}")
                 await asyncio.sleep(self.wait_timeout)
                 continue
-            return result
 
     async def _create_initial_entry(self) -> None:
         """Send the initial log entry to Ghostwriter's Oplog."""
@@ -253,14 +259,10 @@ class MythicSync:
             "server": f"Mythic Server ({self.MYTHIC_IP})",
         }
         await self._execute_query(self.initial_query, variable_values)
-        await mythic.execute_custom_query(
-            mythic=self.mythic_instance,
-            query=self.mythic_notification_query,
-            variables={
-                "message": "Mythic Sync successfully posted its initial log entry to Ghostwriter",
-                "level": "info"
-            },
-        )
+        await mythic.send_event_log_message(mythic=self.mythic_instance,
+                                            message="Mythic Sync successfully posted its initial log entry to Ghostwriter",
+                                            source="mythic_sync",
+                                            level="info")
         return
 
     async def _post_error_notification(self, message: str = None) -> None:
@@ -270,14 +272,10 @@ class MythicSync:
                       "Run this command to review the issue:\n\n" \
                       "  sudo ./mythic-cli logs mythic_sync"
         mythic_sync_log.info("Submitting an error notification to Mythic's notification center")
-        await mythic.execute_custom_query(
-            mythic=self.mythic_instance,
-            query=self.mythic_notification_query,
-            variables={
-                "message": message,
-                "level": "warning"
-            },
-        )
+        await mythic.send_event_log_message(mythic=self.mythic_instance,
+                                            message=message,
+                                            source="mythic_sync",
+                                            level="warning")
         return
 
     async def _mythic_task_to_ghostwriter_message(self, message: dict) -> dict:
@@ -304,10 +302,10 @@ class MythicSync:
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
             gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
             hostname = message["callback"]["host"]
-            source_ip = message["callback"]["ip"]
+            source_ip = await self._get_sorted_ips(message["callback"]["ip"])
             gw_message["sourceIp"] = f"{hostname} ({source_ip})"
             gw_message["userContext"] = message["callback"]["user"]
-            gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["ptype"]
+            gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
         except Exception:
             mythic_sync_log.exception("Encountered an exception while processing Mythic's message into a message for Ghostwriter")
         return gw_message
@@ -325,14 +323,15 @@ class MythicSync:
         try:
             callback_date = datetime.strptime(message["init_callback"], "%Y-%m-%dT%H:%M:%S.%f")
             gw_message["startDate"] = callback_date.strftime("%Y-%m-%d %H:%M:%S")
-            gw_message["output"] = f"New Callback {message['id']}"
+            gw_message["output"] = f"New Callback {message['display_id']}"
             integrity = self.integrity_levels[message["integrity_level"]]
             opsys = message['os'].replace("\n", " ")
             gw_message["comments"] = f"Integrity Level: {integrity}\nProcess: {message['process_name']} (pid {message['pid']})\nOS: {opsys}"
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
-            gw_message["sourceIp"] = f"{message['host']} ({message['ip']})"
+            source_ip = await self._get_sorted_ips(message["ip"])
+            gw_message["sourceIp"] = f"{message['host']} ({source_ip})"
             gw_message["userContext"] = message["user"]
-            gw_message["tool"] = message["payload"]["payloadtype"]["ptype"]
+            gw_message["tool"] = message["payload"]["payloadtype"]["name"]
             gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
         except Exception:
             mythic_sync_log.exception(
@@ -419,6 +418,7 @@ class MythicSync:
         custom_return_attributes = """
         agent_task_id
         id
+        display_id
         timestamp
         status_timestamp_submitted
         status_timestamp_processed
@@ -431,17 +431,18 @@ class MythicSync:
         callback {
             host
             ip
+            display_id
             user
             payload {
                 payloadtype {
-                    ptype
+                    name
                 }
             }
         }
         """
         mythic_sync_log.info("Starting subscription for tasks")
         async for data in mythic.subscribe_all_tasks_and_updates(
-                mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes
+                mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes,
         ):
             try:
                 entry_id = rconn.get(data["agent_task_id"])
@@ -469,6 +470,7 @@ class MythicSync:
         description
         host
         id
+        display_id
         extra_info
         ip
         os
@@ -476,19 +478,19 @@ class MythicSync:
         process_name
         user
         operator {
-        username
+            username
         }
         payload {
-        payloadtype {
-            ptype
-        }
+            payloadtype {
+                name
+            }
         }
         """
         mythic_sync_log.info("Starting subscription for callbacks")
         async for data in mythic.subscribe_new_callbacks(
-                mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes
+                mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes, batch_size=1
         ):
-            await self._create_entry(data)
+            await self._create_entry(data[0])
 
     async def _wait_for_service(self) -> None:
         """Wait for an HTTP session to be established with Mythic."""
@@ -572,8 +574,7 @@ class MythicSync:
                         apitoken=self.MYTHIC_API_KEY,
                         server_ip=self.MYTHIC_IP,
                         server_port=self.MYTHIC_PORT,
-                        ssl=True,
-                        global_timeout=-1)
+                        ssl=True)
                     await mythic.get_me(mythic=mythic_instance)
                 except Exception:
                     mythic_sync_log.exception(
