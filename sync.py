@@ -5,6 +5,8 @@ import os
 import sys
 from asyncio.exceptions import TimeoutError
 from datetime import datetime
+import json
+import ipaddress
 
 # 3rd Party Libraries
 import aiohttp
@@ -192,6 +194,16 @@ class MythicSync:
 
         await self._create_initial_entry()
 
+    async def _get_sorted_ips(self, ip: str) -> list[str]:
+        source_ips = json.loads(ip)
+        source_ips = [x for x in source_ips if x != ""]
+
+        for i in range(len(source_ips)):
+            source_ips[i] = ipaddress.ip_address(source_ips[i])
+        source_ips = [str(x) for x in sorted(source_ips)]
+        source_ip = json.dumps(source_ips)
+        return source_ip
+
     async def _execute_query(self, query: DocumentNode, variable_values: dict) -> dict:
         """
         Execute a GraphQL query against the Ghostwriter server.
@@ -203,31 +215,39 @@ class MythicSync:
         ``variable_values``
             The parameters to pass to the query
         """
-        result = {}
         while True:
             try:
                 async with Client(transport=self.transport, fetch_schema_from_transport=False, ) as session:
                     try:
                         result = await session.execute(query, variable_values=variable_values)
                         mythic_sync_log.debug("Successfully executed query with result: %s", result)
+                        return result
                     except TimeoutError:
                         mythic_sync_log.error(
                             "Timeout occurred while trying to connect to Ghostwriter at %s",
                             self.GHOSTWRITER_URL
                         )
+                        await self._post_error_notification(f"MythicSync:\nTimeout occurred while trying to connect to Ghostwriter at {self.GHOSTWRITER_URL}",)
+                        await asyncio.sleep(self.wait_timeout)
+                        continue
                     except TransportQueryError as e:
-                        mythic_sync_log.error("Error encountered while fetching GrpahQL schema: %s", e)
+                        mythic_sync_log.exception("Error encountered while fetching GrpahQL schema: %s", e)
+                        await self._post_error_notification(f"MythicSync:\nError encountered while fetching GrpahQL schema: {e}")
+                        await asyncio.sleep(self.wait_timeout)
+                        continue
                     except GraphQLError as e:
-                        mythic_sync_log.error("Error with GraphQL query: %s", e)
-            except Exception:
+                        mythic_sync_log.exception("Error with GraphQL query: %s", e)
+                        await self._post_error_notification(f"MythicSync:\nError with GraphQL query: {e}")
+                        await asyncio.sleep(self.wait_timeout)
+                        continue
+            except Exception as exc:
                 mythic_sync_log.exception(
                     "Exception occurred while trying to post the query to Ghostwriter! Trying again in %s seconds...",
                     self.wait_timeout
                 )
-                await self._post_error_notification()
+                await self._post_error_notification(f"MythicSync:\nException occurred while trying to post the query to Ghostwriter!\n{exc}")
                 await asyncio.sleep(self.wait_timeout)
                 continue
-            return result
 
     async def _create_initial_entry(self) -> None:
         """Send the initial log entry to Ghostwriter's Oplog."""
@@ -282,7 +302,7 @@ class MythicSync:
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
             gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
             hostname = message["callback"]["host"]
-            source_ip = message["callback"]["ip"]
+            source_ip = await self._get_sorted_ips(message["callback"]["ip"])
             gw_message["sourceIp"] = f"{hostname} ({source_ip})"
             gw_message["userContext"] = message["callback"]["user"]
             gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
@@ -303,12 +323,13 @@ class MythicSync:
         try:
             callback_date = datetime.strptime(message["init_callback"], "%Y-%m-%dT%H:%M:%S.%f")
             gw_message["startDate"] = callback_date.strftime("%Y-%m-%d %H:%M:%S")
-            gw_message["output"] = f"New Callback {message['id']}"
+            gw_message["output"] = f"New Callback {message['display_id']}"
             integrity = self.integrity_levels[message["integrity_level"]]
             opsys = message['os'].replace("\n", " ")
             gw_message["comments"] = f"Integrity Level: {integrity}\nProcess: {message['process_name']} (pid {message['pid']})\nOS: {opsys}"
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
-            gw_message["sourceIp"] = f"{message['host']} ({message['ip']})"
+            source_ip = await self._get_sorted_ips(message["callback"]["ip"])
+            gw_message["sourceIp"] = f"{message['host']} ({source_ip})"
             gw_message["userContext"] = message["user"]
             gw_message["tool"] = message["payload"]["payloadtype"]["name"]
             gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
@@ -410,6 +431,7 @@ class MythicSync:
         callback {
             host
             ip
+            display_id
             user
             payload {
                 payloadtype {
@@ -420,7 +442,7 @@ class MythicSync:
         """
         mythic_sync_log.info("Starting subscription for tasks")
         async for data in mythic.subscribe_all_tasks_and_updates(
-                mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes
+                mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes,
         ):
             try:
                 entry_id = rconn.get(data["agent_task_id"])
