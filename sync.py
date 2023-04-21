@@ -328,7 +328,7 @@ class MythicSync:
             opsys = message['os'].replace("\n", " ")
             gw_message["comments"] = f"Integrity Level: {integrity}\nProcess: {message['process_name']} (pid {message['pid']})\nOS: {opsys}"
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
-            source_ip = await self._get_sorted_ips(message["callback"]["ip"])
+            source_ip = await self._get_sorted_ips(message["ip"])
             gw_message["sourceIp"] = f"{message['host']} ({source_ip})"
             gw_message["userContext"] = message["user"]
             gw_message["tool"] = message["payload"]["payloadtype"]["name"]
@@ -488,9 +488,9 @@ class MythicSync:
         """
         mythic_sync_log.info("Starting subscription for callbacks")
         async for data in mythic.subscribe_new_callbacks(
-                mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes
+                mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes, batch_size=1
         ):
-            await self._create_entry(data)
+            await self._create_entry(data[0])
 
     async def _wait_for_service(self) -> None:
         """Wait for an HTTP session to be established with Mythic."""
