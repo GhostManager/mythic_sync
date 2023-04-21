@@ -18,7 +18,7 @@ from graphql.error.graphql_error import GraphQLError
 # Mythic Sync Libraries
 from mythic import mythic, mythic_classes
 
-VERSION = "2.0.2"
+VERSION = "2.1.0"
 
 # Logging configuration
 # Level applies to all loggers, including ``gql`` Transport and Client loggers
@@ -146,19 +146,14 @@ class MythicSync:
     if MYTHIC_PORT is None:
         mythic_sync_log.error("MYTHIC_PORT must be supplied!")
         sys.exit(1)
+    else:
+        MYTHIC_PORT = int(MYTHIC_PORT)
 
     MYTHIC_URL = f"https://{MYTHIC_IP}:{MYTHIC_PORT}"
 
-    # Mythic's Redis server
-    REDIS_HOSTNAME = os.environ.get("REDIS_HOSTNAME")
-    if REDIS_HOSTNAME is None:
-        mythic_sync_log.error("REDIS_HOSTNAME must be supplied!")
-        sys.exit(1)
-
-    REDIS_PORT = os.environ.get("REDIS_PORT")
-    if REDIS_PORT is None:
-        mythic_sync_log.error("REDIS_PORT must be supplied!")
-        sys.exit(1)
+    # Redis server
+    REDIS_HOSTNAME = "127.0.0.1"
+    REDIS_PORT = 6379
 
     # Ghostwriter server authentication
     GHOSTWRITER_API_KEY = os.environ.get("GHOSTWRITER_API_KEY")
@@ -307,7 +302,7 @@ class MythicSync:
             source_ip = message["callback"]["ip"]
             gw_message["sourceIp"] = f"{hostname} ({source_ip})"
             gw_message["userContext"] = message["callback"]["user"]
-            gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["ptype"]
+            gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
         except Exception:
             mythic_sync_log.exception("Encountered an exception while processing Mythic's message into a message for Ghostwriter")
         return gw_message
@@ -332,7 +327,7 @@ class MythicSync:
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
             gw_message["sourceIp"] = f"{message['host']} ({message['ip']})"
             gw_message["userContext"] = message["user"]
-            gw_message["tool"] = message["payload"]["payloadtype"]["ptype"]
+            gw_message["tool"] = message["payload"]["payloadtype"]["name"]
             gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
         except Exception:
             mythic_sync_log.exception(
@@ -419,6 +414,7 @@ class MythicSync:
         custom_return_attributes = """
         agent_task_id
         id
+        display_id
         timestamp
         status_timestamp_submitted
         status_timestamp_processed
@@ -434,7 +430,7 @@ class MythicSync:
             user
             payload {
                 payloadtype {
-                    ptype
+                    name
                 }
             }
         }
@@ -469,6 +465,7 @@ class MythicSync:
         description
         host
         id
+        display_id
         extra_info
         ip
         os
@@ -476,12 +473,12 @@ class MythicSync:
         process_name
         user
         operator {
-        username
+            username
         }
         payload {
-        payloadtype {
-            ptype
-        }
+            payloadtype {
+                name
+            }
         }
         """
         mythic_sync_log.info("Starting subscription for callbacks")
@@ -572,8 +569,7 @@ class MythicSync:
                         apitoken=self.MYTHIC_API_KEY,
                         server_ip=self.MYTHIC_IP,
                         server_port=self.MYTHIC_PORT,
-                        ssl=True,
-                        global_timeout=-1)
+                        ssl=True)
                     await mythic.get_me(mythic=mythic_instance)
                 except Exception:
                     mythic_sync_log.exception(
