@@ -209,10 +209,13 @@ class MythicSync:
     async def _get_sorted_ips(self, ip: str) -> str:
         source_ips = json.loads(ip)
         source_ips = [x for x in source_ips if x != ""]
-
+        source_ipv4 = []
         for i in range(len(source_ips)):
-            source_ips[i] = ipaddress.ip_address(source_ips[i])
-        source_ips = [str(x) for x in sorted(source_ips)]
+            new_address = ipaddress.ip_address(source_ips[i])
+            if isinstance(new_address, ipaddress.IPv4Address):
+                source_ipv4.append(new_address)
+        source_ipv4 = [str(x) for x in sorted(source_ipv4)]
+        source_ips = source_ipv4
         source_ip = json.dumps(source_ips)
         return source_ip
 
