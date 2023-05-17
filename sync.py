@@ -204,7 +204,7 @@ class MythicSync:
         source_ip = json.dumps(source_ips)
         return source_ip
 
-    async def _execute_query(self, query: DocumentNode, variable_values: dict) -> dict:
+    async def _execute_query(self, query: DocumentNode, variable_values: dict = None) -> dict:
         """
         Execute a GraphQL query against the Ghostwriter server.
 
@@ -259,10 +259,12 @@ class MythicSync:
             "server": f"Mythic Server ({self.MYTHIC_IP})",
         }
         await self._execute_query(self.initial_query, variable_values)
-        await mythic.send_event_log_message(mythic=self.mythic_instance,
-                                            message="Mythic Sync successfully posted its initial log entry to Ghostwriter",
-                                            source="mythic_sync",
-                                            level="info")
+        await mythic.send_event_log_message(
+            mythic=self.mythic_instance,
+            message="Mythic Sync successfully posted its initial log entry to Ghostwriter",
+            source="mythic_sync",
+            level="info"
+        )
         return
 
     async def _post_error_notification(self, message: str = None) -> None:
@@ -307,7 +309,9 @@ class MythicSync:
             gw_message["userContext"] = message["callback"]["user"]
             gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
         except Exception:
-            mythic_sync_log.exception("Encountered an exception while processing Mythic's message into a message for Ghostwriter")
+            mythic_sync_log.exception(
+                "Encountered an exception while processing Mythic's message into a message for Ghostwriter"
+            )
         return gw_message
 
     async def _mythic_callback_to_ghostwriter_message(self, message: dict) -> dict:
