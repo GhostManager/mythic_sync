@@ -20,7 +20,7 @@ from graphql.error.graphql_error import GraphQLError
 # Mythic Sync Libraries
 from mythic import mythic, mythic_classes
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 
 # Logging configuration
 # Level applies to all loggers, including ``gql`` Transport and Client loggers
