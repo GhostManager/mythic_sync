@@ -274,6 +274,7 @@ class MythicSync:
     async def _check_token(self) -> None:
         """Send a `whoami` query to Ghostwriter to check authentication and token expiration."""
         whoami = await self._execute_query(self.whoami_query)
+        expiry = datetime.fromisoformat(whoami["whoami"]["expires"])
         await mythic.send_event_log_message(
             mythic=self.mythic_instance,
             message=f"Mythic Sync has successfully authenticated to Ghostwriter. Your configured token expires at: {expiry}",
