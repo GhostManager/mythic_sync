@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-* The Mythic Sync service will now check your Ghostwriter API token's expiration date and send a warning if it will expire within 24 hours
+* The Mythic Sync service will now check your Ghostwriter API token's expiration date and send a warning if it expires within 24 hours
 * Added solution suggestions for GraphQL that can be caused by providing an invalid or expired API token or an incorrect/non-existent log ID 
 
 ## [3.0.0] - 11 May 2023
