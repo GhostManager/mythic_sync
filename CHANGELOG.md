@@ -1,8 +1,16 @@
 # Changelog
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [3.0.1] - 17 May 2023
+
+### Changed
+
+* The Mythic Sync service will now check your Ghostwriter API token's expiration date and send a warning if it expires within 24 hours
+* Added solution suggestions for GraphQL that can be caused by providing an invalid or expired API token or an incorrect/non-existent log ID 
 
 ## [3.0.0] - 11 May 2023
 

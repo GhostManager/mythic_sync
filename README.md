@@ -2,7 +2,7 @@
 
 [![Sponsored by SpecterOps](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fspecterops%2F.github%2Fmain%2Fconfig%2Fshield.json&style=flat)](https://github.com/specterops#ghostwriter)
 
-[![Python Version](https://img.shields.io/badge/Python-3.10-brightgreen.svg)](.) [![License](https://img.shields.io/badge/License-BSD3-darkred.svg)](.) ![GitHub Release (Latest by Date)](https://img.shields.io/github/v/release/GhostManager/mythic_sync?label=Latest%20Release) ![GitHub Release Date](https://img.shields.io/github/release-date/ghostmanager/mythic_sync?label=Release%20Date&color=blue)
+[![Python Version](https://img.shields.io/badge/Python-3.10-brightgreen.svg)](.) [![License](https://img.shields.io/badge/License-BSD3-darkred.svg)](.) ![GitHub Release (Latest by Date)](https://img.shields.io/github/v/release/GhostManager/mythic_sync?label=Latest%20Release) ![GitHub Release Date](https://img.shields.io/github/release-date/GhostManager/mythic_sync?label=Release%20Date&color=blue)
 
 The `mythic_sync` utility connects to a [Mythic](https://github.com/its-a-feature/Mythic) C2 server (>=3.0.0+) to ingest events and post these events to the [Ghostwriter](https://github.com/GhostManager/Ghostwriter) (>=v3.0.1) GraphQL API to create real-time activity logs.
 

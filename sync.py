@@ -1,12 +1,12 @@
 # Standard Libraries
 import asyncio
+import ipaddress
+import json
 import logging
 import os
 import sys
 from asyncio.exceptions import TimeoutError
-from datetime import datetime
-import json
-import ipaddress
+from datetime import datetime, timedelta, timezone
 
 # 3rd Party Libraries
 import aiohttp
@@ -49,6 +49,17 @@ class MythicSync:
 
     # How long to wait for a service to start before retrying an HTTP request
     wait_timeout = 5
+
+    # Query for the whoami expiration checks
+    whoami_query = gql(
+        """
+        query whoami {
+          whoami {
+            expires
+          }
+        }
+        """
+    )
 
     # Query for the first log sent after initialization
     initial_query = gql(
@@ -192,19 +203,23 @@ class MythicSync:
         self.mythic_instance = await self.__wait_for_authentication()
         mythic_sync_log.info("Successfully authenticated to Mythic")
 
+        await self._check_token()
         await self._create_initial_entry()
 
-    async def _get_sorted_ips(self, ip: str) -> list[str]:
+    async def _get_sorted_ips(self, ip: str) -> str:
         source_ips = json.loads(ip)
         source_ips = [x for x in source_ips if x != ""]
-
+        source_ipv4 = []
         for i in range(len(source_ips)):
-            source_ips[i] = ipaddress.ip_address(source_ips[i])
-        source_ips = [str(x) for x in sorted(source_ips)]
+            new_address = ipaddress.ip_address(source_ips[i])
+            if isinstance(new_address, ipaddress.IPv4Address):
+                source_ipv4.append(new_address)
+        source_ipv4 = [str(x) for x in sorted(source_ipv4)]
+        source_ips = source_ipv4
         source_ip = json.dumps(source_ips)
         return source_ip
 
-    async def _execute_query(self, query: DocumentNode, variable_values: dict) -> dict:
+    async def _execute_query(self, query: DocumentNode, variable_values: dict = None) -> dict:
         """
         Execute a GraphQL query against the Ghostwriter server.
 
@@ -231,8 +246,30 @@ class MythicSync:
                         await asyncio.sleep(self.wait_timeout)
                         continue
                     except TransportQueryError as e:
-                        mythic_sync_log.exception("Error encountered while fetching GrpahQL schema: %s", e)
-                        await self._post_error_notification(f"MythicSync:\nError encountered while fetching GrpahQL schema: {e}")
+                        mythic_sync_log.exception("Error encountered while fetching GraphQL schema: %s", e)
+                        await self._post_error_notification(f"MythicSync:\nError encountered while fetching GraphQL schema: {e}")
+                        payload = e.errors[0]
+                        if "extensions" in payload:
+                            if "code" in payload["extensions"]:
+                                if payload["extensions"]["code"] == "access-denied":
+                                    mythic_sync_log.error(
+                                        "Access denied for the provided Ghostwriter API token! Check if it is valid, update your configuration, and restart")
+                                    await mythic.send_event_log_message(
+                                        mythic=self.mythic_instance,
+                                        message=f"Access denied for the provided Ghostwriter API token! Check if it is valid, update your Mythic Sync configuration, and restart the service.",
+                                        source="mythic_sync_reject",
+                                        level="warning"
+                                    )
+                                    exit(1)
+                                if payload["extensions"]["code"] == "postgres-error":
+                                    mythic_sync_log.error(
+                                        "Ghostwriter's database rejected the query! Check if your configured log ID is correct.")
+                                    await mythic.send_event_log_message(
+                                        mythic=self.mythic_instance,
+                                        message=f"Ghostwriter's database rejected the query! Check if your configured log ID ({self.GHOSTWRITER_OPLOG_ID}) is correct.",
+                                        source="mythic_sync_reject",
+                                        level="warning"
+                                    )
                         await asyncio.sleep(self.wait_timeout)
                         continue
                     except GraphQLError as e:
@@ -249,6 +286,28 @@ class MythicSync:
                 await asyncio.sleep(self.wait_timeout)
                 continue
 
+    async def _check_token(self) -> None:
+        """Send a `whoami` query to Ghostwriter to check authentication and token expiration."""
+        whoami = await self._execute_query(self.whoami_query)
+        expiry = datetime.fromisoformat(whoami["whoami"]["expires"])
+        await mythic.send_event_log_message(
+            mythic=self.mythic_instance,
+            message=f"Mythic Sync has successfully authenticated to Ghostwriter. Your configured token expires at: {expiry}",
+            source="mythic_sync",
+            level="info"
+        )
+
+        # Check if the token will expire within 24 hours
+        now = datetime.now(timezone.utc)
+        if expiry - now < timedelta(hours=24):
+            mythic_sync_log.debug(f"The provided Ghostwriter API token expires in less than 24 hours ({expiry})!")
+            await mythic.send_event_log_message(
+                mythic=self.mythic_instance,
+                message=f"The provided Ghostwriter API token expires in less than 24 hours ({expiry})!",
+                source="mythic_sync",
+                level="warning"
+            )
+
     async def _create_initial_entry(self) -> None:
         """Send the initial log entry to Ghostwriter's Oplog."""
         mythic_sync_log.info("Sending the initial Ghostwriter log entry")
@@ -259,10 +318,12 @@ class MythicSync:
             "server": f"Mythic Server ({self.MYTHIC_IP})",
         }
         await self._execute_query(self.initial_query, variable_values)
-        await mythic.send_event_log_message(mythic=self.mythic_instance,
-                                            message="Mythic Sync successfully posted its initial log entry to Ghostwriter",
-                                            source="mythic_sync",
-                                            level="info")
+        await mythic.send_event_log_message(
+            mythic=self.mythic_instance,
+            message="Mythic Sync successfully posted its initial log entry to Ghostwriter",
+            source="mythic_sync",
+            level="info"
+        )
         return
 
     async def _post_error_notification(self, message: str = None) -> None:
@@ -307,7 +368,9 @@ class MythicSync:
             gw_message["userContext"] = message["callback"]["user"]
             gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
         except Exception:
-            mythic_sync_log.exception("Encountered an exception while processing Mythic's message into a message for Ghostwriter")
+            mythic_sync_log.exception(
+                "Encountered an exception while processing Mythic's message into a message for Ghostwriter"
+            )
         return gw_message
 
     async def _mythic_callback_to_ghostwriter_message(self, message: dict) -> dict:
