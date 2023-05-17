@@ -251,10 +251,22 @@ class MythicSync:
                                 if payload["extensions"]["code"] == "access-denied":
                                     mythic_sync_log.error(
                                         "Access denied for the provided Ghostwriter API token! Check if it is valid, update your configuration, and restart")
+                                    await mythic.send_event_log_message(
+                                        mythic=self.mythic_instance,
+                                        message=f"Access denied for the provided Ghostwriter API token! Check if it is valid, update your Mythic Sync configuration, and restart the service.",
+                                        source="mythic_sync_reject",
+                                        level="warning"
+                                    )
                                     exit(1)
                                 if payload["extensions"]["code"] == "postgres-error":
                                     mythic_sync_log.error(
                                         "Ghostwriter's database rejected the query! Check if your configured log ID is correct.")
+                                    await mythic.send_event_log_message(
+                                        mythic=self.mythic_instance,
+                                        message=f"Ghostwriter's database rejected the query! Check if your configured log ID ({self.GHOSTWRITER_OPLOG_ID}) is correct.",
+                                        source="mythic_sync_reject",
+                                        level="warning"
+                                    )
                         await asyncio.sleep(self.wait_timeout)
                         continue
                     except GraphQLError as e:
