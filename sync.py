@@ -289,7 +289,11 @@ class MythicSync:
     async def _check_token(self) -> None:
         """Send a `whoami` query to Ghostwriter to check authentication and token expiration."""
         whoami = await self._execute_query(self.whoami_query)
-        expiry = datetime.fromisoformat(whoami["whoami"]["expires"])
+        try:
+            expiry = datetime.fromisoformat(whoami["whoami"]["expires"])
+        except Exception:
+            expiry = whoami["whoami"]["expires"]
+        
         await mythic.send_event_log_message(
             mythic=self.mythic_instance,
             message=f"Mythic Sync has successfully authenticated to Ghostwriter. Your configured token expires at: {expiry}",
@@ -299,7 +303,7 @@ class MythicSync:
 
         # Check if the token will expire within 24 hours
         now = datetime.now(timezone.utc)
-        if expiry - now < timedelta(hours=24):
+        if isinstance(expiry, datetime) and expiry - now < timedelta(hours=24):
             mythic_sync_log.debug(f"The provided Ghostwriter API token expires in less than 24 hours ({expiry})!")
             await mythic.send_event_log_message(
                 mythic=self.mythic_instance,
