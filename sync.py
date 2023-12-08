@@ -208,7 +208,8 @@ class MythicSync:
 
     async def _get_sorted_ips(self, ip: str) -> str:
         source_ips = json.loads(ip)
-        source_ips = [x for x in source_ips if x != ""]
+        # account for CIDR notation (ex: 192.168.0.123/24) in IPs list to make sure we only get the actual IP
+        source_ips = [x.split("/")[0] for x in source_ips if x != ""]
         source_ipv4 = []
         for i in range(len(source_ips)):
             new_address = ipaddress.ip_address(source_ips[i])
@@ -369,6 +370,7 @@ class MythicSync:
             hostname = message["callback"]["host"]
             source_ip = await self._get_sorted_ips(message["callback"]["ip"])
             gw_message["sourceIp"] = f"{hostname} ({source_ip})"
+            gw_message["description"] = f"PID: {message['callback']['pid']}, Callback: {message['callback']['display_id']}"
             gw_message["userContext"] = message["callback"]["user"]
             gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
         except Exception:
@@ -390,10 +392,10 @@ class MythicSync:
         try:
             callback_date = datetime.strptime(message["init_callback"], "%Y-%m-%dT%H:%M:%S.%f")
             gw_message["startDate"] = callback_date.strftime("%Y-%m-%d %H:%M:%S")
-            gw_message["output"] = f"New Callback {message['display_id']}"
+            gw_message["comments"] = f"New Callback {message['display_id']}"
             integrity = self.integrity_levels[message["integrity_level"]]
-            opsys = message['os'].replace("\n", " ")
-            gw_message["comments"] = f"Integrity Level: {integrity}\nProcess: {message['process_name']} (pid {message['pid']})\nOS: {opsys}"
+            opsys = message['os'].replace("\n", ", ")
+            gw_message["description"] = f"Computer: {message['host']}, Integrity Level: {integrity}, Process: {message['process_name']}, PID: {message['pid']}, User: {message['user']}, Domain: {message['domain']}, OS: {opsys}"
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
             source_ip = await self._get_sorted_ips(message["ip"])
             gw_message["sourceIp"] = f"{message['host']} ({source_ip})"
@@ -542,6 +544,7 @@ class MythicSync:
         ip
         os
         pid
+        domain
         process_name
         user
         operator {
