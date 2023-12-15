@@ -20,7 +20,7 @@ from graphql.error.graphql_error import GraphQLError
 # Mythic Sync Libraries
 from mythic import mythic, mythic_classes
 
-VERSION = "3.0.0"
+VERSION = "3.0.4"
 
 # Logging configuration
 # Level applies to all loggers, including ``gql`` Transport and Client loggers
@@ -61,6 +61,17 @@ class MythicSync:
         """
     )
 
+    # Query for specific oplog entry
+    entry_identifier_query = gql(
+        """
+        query checkEntryIdentifier($entry_identifier: String!, $oplog: bigint!){
+            oplogEntry(where: {oplog: {_eq: $oplog}, entry_identifier: {_eq: $entry_identifier}}, limit: 1){
+                id
+            }
+        }
+        """
+    )
+
     # Query for the first log sent after initialization
     initial_query = gql(
         """
@@ -83,7 +94,7 @@ class MythicSync:
         mutation InsertMythicSyncLog (
             $oplog: bigint!, $startDate: timestamptz, $endDate: timestamptz, $sourceIp: String, $destIp: String,
             $tool: String, $userContext: String, $command: String, $description: String,
-            $output: String, $comments: String, $operatorName: String
+            $output: String, $comments: String, $operatorName: String, $entry_identifier: String!
         ) {
             insert_oplogEntry(objects: {
                 oplog: $oplog,
@@ -98,6 +109,7 @@ class MythicSync:
                 output: $output,
                 comments: $comments,
                 operatorName: $operatorName,
+                entry_identifier: $entry_identifier
             }) {
                 returning { id }
             }
@@ -208,7 +220,8 @@ class MythicSync:
 
     async def _get_sorted_ips(self, ip: str) -> str:
         source_ips = json.loads(ip)
-        source_ips = [x for x in source_ips if x != ""]
+        # account for CIDR notation (ex: 192.168.0.123/24) in IPs list to make sure we only get the actual IP
+        source_ips = [x.split("/")[0] for x in source_ips if x != ""]
         source_ipv4 = []
         for i in range(len(source_ips)):
             new_address = ipaddress.ip_address(source_ips[i])
@@ -369,8 +382,10 @@ class MythicSync:
             hostname = message["callback"]["host"]
             source_ip = await self._get_sorted_ips(message["callback"]["ip"])
             gw_message["sourceIp"] = f"{hostname} ({source_ip})"
+            gw_message["description"] = f"PID: {message['callback']['pid']}, Callback: {message['callback']['display_id']}"
             gw_message["userContext"] = message["callback"]["user"]
             gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
+            gw_message['entry_identifier'] = message["agent_task_id"]
         except Exception:
             mythic_sync_log.exception(
                 "Encountered an exception while processing Mythic's message into a message for Ghostwriter"
@@ -390,16 +405,17 @@ class MythicSync:
         try:
             callback_date = datetime.strptime(message["init_callback"], "%Y-%m-%dT%H:%M:%S.%f")
             gw_message["startDate"] = callback_date.strftime("%Y-%m-%d %H:%M:%S")
-            gw_message["output"] = f"New Callback {message['display_id']}"
+            gw_message["comments"] = f"New Callback {message['display_id']}"
             integrity = self.integrity_levels[message["integrity_level"]]
-            opsys = message['os'].replace("\n", " ")
-            gw_message["comments"] = f"Integrity Level: {integrity}\nProcess: {message['process_name']} (pid {message['pid']})\nOS: {opsys}"
+            opsys = message['os'].replace("\n", ", ")
+            gw_message["description"] = f"Computer: {message['host']}, Integrity Level: {integrity}, Process: {message['process_name']}, PID: {message['pid']}, User: {message['user']}, Domain: {message['domain']}, OS: {opsys}"
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
             source_ip = await self._get_sorted_ips(message["ip"])
             gw_message["sourceIp"] = f"{message['host']} ({source_ip})"
             gw_message["userContext"] = message["user"]
             gw_message["tool"] = message["payload"]["payloadtype"]["name"]
             gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
+            gw_message['entry_identifier'] = message["agent_callback_id"]
         except Exception:
             mythic_sync_log.exception(
                 "Encountered an exception while processing Mythic's message into a message for Ghostwriter! Received message: %s",
@@ -436,10 +452,19 @@ class MythicSync:
         if entry_id:
             result = None
             try:
+                query_result = await self._execute_query(self.entry_identifier_query, {
+                    "oplog": gw_message["oplog"],
+                    "entry_identifier": gw_message['entry_identifier'],
+                })
+                if query_result and "oplogEntry" in query_result and len(query_result["oplogEntry"]) > 0:
+                    mythic_sync_log.info(f"Duplicate entry found based on entry_identifier, {gw_message['entry_identifier']}, not sending")
+                    # save off id of oplog entry with this gw_message['entry_identifier'] so we don't try to send it again
+                    self.rconn.set(entry_id, query_result["oplogEntry"][0]["id"])
+                    return
                 result = await self._execute_query(self.insert_query, gw_message)
                 if result and "insert_oplogEntry" in result:
                     # JSON response example: `{'data': {'insert_oplogEntry': {'returning': [{'id': 192}]}}}`
-                    rconn.set(entry_id, result["insert_oplogEntry"]["returning"][0]["id"])
+                    self.rconn.set(entry_id, result["insert_oplogEntry"]["returning"][0]["id"])
                 else:
                     mythic_sync_log.info(
                         "Did not receive a response with data from Ghostwriter's GraphQL API! Response: %s",
@@ -512,7 +537,7 @@ class MythicSync:
                 mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes,
         ):
             try:
-                entry_id = rconn.get(data["agent_task_id"])
+                entry_id = self.rconn.get(data["agent_task_id"])
             except Exception:
                 mythic_sync_log.exception(
                     "Encountered an exception while connecting to Redis to fetch data! Data returned by Mythic: %s",
@@ -542,6 +567,7 @@ class MythicSync:
         ip
         os
         pid
+        domain
         process_name
         user
         operator {
@@ -576,10 +602,9 @@ class MythicSync:
 
     async def _wait_for_redis(self) -> None:
         """Wait for a connection to be established with Mythic's Redis container."""
-        global rconn
         while True:
             try:
-                rconn = redis.Redis(host=self.REDIS_HOSTNAME, port=self.REDIS_PORT, db=1)
+                self.rconn = redis.Redis(host=self.REDIS_HOSTNAME, port=self.REDIS_PORT, db=1)
                 return
             except Exception:
                 mythic_sync_log.exception(
