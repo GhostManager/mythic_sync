@@ -124,6 +124,7 @@ class MythicSync:
             $id: bigint!, $oplog: bigint!, $startDate: timestamptz, $endDate: timestamptz, $sourceIp: String,
             $destIp: String, $tool: String, $userContext: String, $command: String,
             $description: String, $output: String, $comments: String, $operatorName: String,
+            $entry_identifier: String,
         ) {
             update_oplogEntry(where: {
                 id: {_eq: $id}
@@ -140,6 +141,7 @@ class MythicSync:
                 output: $output,
                 comments: $comments,
                 operatorName: $operatorName,
+                entry_identifier: $entry_identifier
             }) {
                 returning { id }
             }
@@ -449,7 +451,7 @@ class MythicSync:
                 "contents: %s", message
             )
 
-        if entry_id:
+        if entry_id != "" and 'entry_identifier' in gw_message:
             result = None
             try:
                 query_result = await self._execute_query(self.entry_identifier_query, {
@@ -523,6 +525,7 @@ class MythicSync:
         callback {
             host
             ip
+            pid
             display_id
             user
             payload {
