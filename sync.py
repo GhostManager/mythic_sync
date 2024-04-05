@@ -65,7 +65,7 @@ class MythicSync:
     entry_identifier_query = gql(
         """
         query checkEntryIdentifier($entry_identifier: String!, $oplog: bigint!){
-            oplogEntry(where: {oplog: {_eq: $oplog}, entry_identifier: {_eq: $entry_identifier}}, limit: 1){
+            oplogEntry(where: {oplog: {_eq: $oplog}, entryIdentifier: {_eq: $entry_identifier}}, limit: 1){
                 id
             }
         }
@@ -109,7 +109,7 @@ class MythicSync:
                 output: $output,
                 comments: $comments,
                 operatorName: $operatorName,
-                entry_identifier: $entry_identifier
+                entryIdentifier: $entry_identifier
             }) {
                 returning { id }
             }
@@ -141,7 +141,7 @@ class MythicSync:
                 output: $output,
                 comments: $comments,
                 operatorName: $operatorName,
-                entry_identifier: $entry_identifier
+                entryIdentifier: $entry_identifier
             }) {
                 returning { id }
             }
@@ -459,7 +459,7 @@ class MythicSync:
                     "entry_identifier": gw_message['entry_identifier'],
                 })
                 if query_result and "oplogEntry" in query_result and len(query_result["oplogEntry"]) > 0:
-                    mythic_sync_log.info(f"Duplicate entry found based on entry_identifier, {gw_message['entry_identifier']}, not sending")
+                    mythic_sync_log.info(f"Duplicate entry found based on entryIdentifier, {gw_message['entryIdentifier']}, not sending")
                     # save off id of oplog entry with this gw_message['entry_identifier'] so we don't try to send it again
                     self.rconn.set(entry_id, query_result["oplogEntry"][0]["id"])
                     return
