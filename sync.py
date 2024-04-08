@@ -75,12 +75,13 @@ class MythicSync:
     # Query for the first log sent after initialization
     initial_query = gql(
         """
-        mutation InitializeMythicSync ($oplogId: bigint!, $description: String!, $server: String!) {
+        mutation InitializeMythicSync ($oplogId: bigint!, $description: String!, $server: String!, $extraFields: jsonb!) {
             insert_oplogEntry(objects: {
                 oplog: $oplogId,
                 description: $description,
                 sourceIp: $server,
                 tool: "Mythic",
+                extraFields: $extraFields
             }) {
                 returning { id }
             }
@@ -94,7 +95,7 @@ class MythicSync:
         mutation InsertMythicSyncLog (
             $oplog: bigint!, $startDate: timestamptz, $endDate: timestamptz, $sourceIp: String, $destIp: String,
             $tool: String, $userContext: String, $command: String, $description: String,
-            $output: String, $comments: String, $operatorName: String, $entry_identifier: String!
+            $output: String, $comments: String, $operatorName: String, $entry_identifier: String!, $extraFields: jsonb!
         ) {
             insert_oplogEntry(objects: {
                 oplog: $oplog,
@@ -110,6 +111,7 @@ class MythicSync:
                 comments: $comments,
                 operatorName: $operatorName,
                 entryIdentifier: $entry_identifier
+                extraFields: $extraFields
             }) {
                 returning { id }
             }
@@ -308,7 +310,7 @@ class MythicSync:
             expiry = datetime.fromisoformat(whoami["whoami"]["expires"])
         except Exception:
             expiry = whoami["whoami"]["expires"]
-        
+
         await mythic.send_event_log_message(
             mythic=self.mythic_instance,
             message=f"Mythic Sync has successfully authenticated to Ghostwriter. Your configured token expires at: {expiry}",
@@ -335,6 +337,7 @@ class MythicSync:
             "description": f"Initial entry from mythic_sync at: {self.MYTHIC_IP}. If you're seeing this then oplog "
                            f"syncing is working for this C2 server!",
             "server": f"Mythic Server ({self.MYTHIC_IP})",
+            "extraFields": {}
         }
         await self._execute_query(self.initial_query, variable_values)
         await mythic.send_event_log_message(
@@ -388,6 +391,7 @@ class MythicSync:
             gw_message["userContext"] = message["callback"]["user"]
             gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
             gw_message['entry_identifier'] = message["agent_task_id"]
+            gw_message['extraFields'] = {}
         except Exception:
             mythic_sync_log.exception(
                 "Encountered an exception while processing Mythic's message into a message for Ghostwriter"
@@ -418,6 +422,7 @@ class MythicSync:
             gw_message["tool"] = message["payload"]["payloadtype"]["name"]
             gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
             gw_message['entry_identifier'] = message["agent_callback_id"]
+            gw_message['extraFields'] = {}
         except Exception:
             mythic_sync_log.exception(
                 "Encountered an exception while processing Mythic's message into a message for Ghostwriter! Received message: %s",
@@ -459,7 +464,7 @@ class MythicSync:
                     "entry_identifier": gw_message['entry_identifier'],
                 })
                 if query_result and "oplogEntry" in query_result and len(query_result["oplogEntry"]) > 0:
-                    mythic_sync_log.info(f"Duplicate entry found based on entryIdentifier, {gw_message['entryIdentifier']}, not sending")
+                    mythic_sync_log.info(f"Duplicate entry found based on entryIdentifier, {gw_message['entry_identifier']}, not sending")
                     # save off id of oplog entry with this gw_message['entry_identifier'] so we don't try to send it again
                     self.rconn.set(entry_id, query_result["oplogEntry"][0]["id"])
                     return
