@@ -126,7 +126,7 @@ class MythicSync:
             $id: bigint!, $oplog: bigint!, $startDate: timestamptz, $endDate: timestamptz, $sourceIp: String,
             $destIp: String, $tool: String, $userContext: String, $command: String,
             $description: String, $output: String, $comments: String, $operatorName: String,
-            $entry_identifier: String,
+            $entry_identifier: String, $extraFields: jsonb
         ) {
             update_oplogEntry(where: {
                 id: {_eq: $id}
@@ -143,7 +143,8 @@ class MythicSync:
                 output: $output,
                 comments: $comments,
                 operatorName: $operatorName,
-                entryIdentifier: $entry_identifier
+                entryIdentifier: $entry_identifier,
+                extraFields: $extraFields
             }) {
                 returning { id }
             }
