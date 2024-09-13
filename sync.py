@@ -218,7 +218,7 @@ class MythicSync:
         mythic_sync_log.info("Successfully connected to Redis")
 
         await self._wait_for_service()
-        mythic_sync_log.info("Successfully connected to %s", {self.MYTHIC_URL})
+        mythic_sync_log.info("Successfully connected to %s", self.MYTHIC_URL)
 
         mythic_sync_log.info("Trying to authenticate to Mythic")
         self.mythic_instance = await self.__wait_for_authentication()
@@ -299,7 +299,7 @@ class MythicSync:
                     await asyncio.sleep(self.wait_timeout)
                     continue
             except Exception as exc:
-                mythic_sync_log.exception(
+                mythic_sync_log.error(
                     "Exception occurred while trying to post the query to Ghostwriter! Trying again in %s seconds...",
                     self.wait_timeout
                 )
@@ -599,15 +599,20 @@ class MythicSync:
         """Wait for an HTTP session to be established with Mythic."""
         while True:
             mythic_sync_log.info("Attempting to connect to %s", self.MYTHIC_URL)
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.MYTHIC_URL, ssl=False) as resp:
-                    if resp.status != 200:
-                        mythic_sync_log.warning(
-                            "Expected 200 OK and received HTTP code %s while trying to connect to Mythic, trying again in %s seconds...",
-                            resp.status, self.wait_timeout
-                        )
-                        await asyncio.sleep(self.wait_timeout)
-                        continue
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(self.MYTHIC_URL, ssl=False) as resp:
+                        if resp.status != 200:
+                            mythic_sync_log.warning(
+                                "Expected 200 OK and received HTTP code %s while trying to connect to Mythic, trying again in %s seconds...",
+                                resp.status, self.wait_timeout
+                            )
+                            await asyncio.sleep(self.wait_timeout)
+                            continue
+            except Exception as e:
+                await asyncio.sleep(self.wait_timeout)
+                mythic_sync_log.warning("failed to connect to Mythic: %s", e)
+                continue
             return
 
     async def _wait_for_redis(self) -> None:
@@ -642,25 +647,20 @@ class MythicSync:
                         server_port=self.MYTHIC_PORT,
                         ssl=True,
                         timeout=-1)
-                except Exception:
-                    mythic_sync_log.exception(
+                except Exception as e:
+                    mythic_sync_log.error(
                         "Encountered an exception while trying to authenticate to Mythic, trying again in %s seconds...",
                         self.wait_timeout
-                    )
-                    await self._post_error_notification(
-                        message="Mythic Sync encountered an exception while trying to authenticate to Mythic"
                     )
                     await asyncio.sleep(self.wait_timeout)
                     continue
                 try:
                     await mythic.get_me(mythic=mythic_instance)
-                except Exception:
-                    mythic_sync_log.exception(
-                        "Encountered an exception while trying to authenticate to Mythic, trying again in %s seconds...",
+                except Exception as e:
+                    mythic_sync_log.error(
+                        "Encountered an exception while trying to get user info from Mythic, trying again in %s seconds...",
                         self.wait_timeout
                     )
-                    await self._post_error_notification(
-                        message="Mythic Sync encountered an exception while trying to authenticate to Mythic")
                     await asyncio.sleep(self.wait_timeout)
                     continue
             elif self.MYTHIC_USERNAME == "" and self.MYTHIC_PASSWORD == "":
@@ -678,13 +678,10 @@ class MythicSync:
                         server_port=self.MYTHIC_PORT,
                         ssl=True)
                     await mythic.get_me(mythic=mythic_instance)
-                except Exception:
-                    mythic_sync_log.exception(
+                except Exception as e:
+                    mythic_sync_log.error(
                         "Failed to authenticate with the Mythic API token, trying again in %s seconds...",
                         self.wait_timeout
-                    )
-                    await self._post_error_notification(
-                        message="Mythic Sync encountered an exception while trying to authenticate to Mythic"
                     )
                     await asyncio.sleep(self.wait_timeout)
                     continue
@@ -693,8 +690,8 @@ class MythicSync:
 
 
 async def scripting():
+    mythic_sync = MythicSync()
     while True:
-        mythic_sync = MythicSync()
         await mythic_sync.initialize()
         try:
             _ = await asyncio.gather(
@@ -705,5 +702,7 @@ async def scripting():
             mythic_sync_log.exception(
                 "Encountered an exception while subscribing to tasks and responses, restarting..."
             )
+        finally:
+            await mythic_sync.client.close_async()
 
 asyncio.run(scripting())
