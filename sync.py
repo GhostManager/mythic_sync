@@ -269,8 +269,7 @@ class MythicSync:
                     continue
                 except TransportQueryError as e:
                     mythic_sync_log.exception("Error encountered while fetching GraphQL schema: %s", e)
-                    await self._post_error_notification(
-                        f"MythicSync:\nError encountered while fetching GraphQL schema: {e}")
+
                     payload = e.errors[0]
                     if "extensions" in payload:
                         if "code" in payload["extensions"]:
@@ -290,6 +289,10 @@ class MythicSync:
                                     message=f"Ghostwriter's database rejected the query! Check if your configured log ID ({self.GHOSTWRITER_OPLOG_ID}) is correct.",
                                     source="mythic_sync_reject",
                                 )
+                                await asyncio.sleep(self.wait_timeout)
+                                continue
+                    await self._post_error_notification(
+                        f"MythicSync:\nError encountered while fetching GraphQL schema: {e}")
                     await asyncio.sleep(self.wait_timeout)
                     continue
                 except GraphQLError as e:
