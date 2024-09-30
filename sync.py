@@ -281,7 +281,8 @@ class MythicSync:
                                     source="mythic_sync_reject",
                                     level="warning"
                                 )
-                                exit(1)
+                                await asyncio.sleep(self.wait_timeout)
+                                continue
                             if payload["extensions"]["code"] == "postgres-error":
                                 mythic_sync_log.error(
                                     "Ghostwriter's database rejected the query! Check if your configured log ID is correct.")
