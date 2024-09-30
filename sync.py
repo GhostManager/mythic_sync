@@ -263,34 +263,32 @@ class MythicSync:
                         "Timeout occurred while trying to connect to Ghostwriter at %s",
                         self.GHOSTWRITER_URL
                     )
-                    await self._post_error_notification(f"MythicSync:\nTimeout occurred while trying to connect to Ghostwriter at {self.GHOSTWRITER_URL}",)
+                    await self._post_error_notification(
+                        f"MythicSync:\nTimeout occurred while trying to connect to Ghostwriter at {self.GHOSTWRITER_URL}", )
                     await asyncio.sleep(self.wait_timeout)
                     continue
                 except TransportQueryError as e:
                     mythic_sync_log.exception("Error encountered while fetching GraphQL schema: %s", e)
-                    await self._post_error_notification(f"MythicSync:\nError encountered while fetching GraphQL schema: {e}")
+                    await self._post_error_notification(
+                        f"MythicSync:\nError encountered while fetching GraphQL schema: {e}")
                     payload = e.errors[0]
                     if "extensions" in payload:
                         if "code" in payload["extensions"]:
                             if payload["extensions"]["code"] == "access-denied":
                                 mythic_sync_log.error(
                                     "Access denied for the provided Ghostwriter API token! Check if it is valid, update your configuration, and restart")
-                                await mythic.send_event_log_message(
-                                    mythic=self.mythic_instance,
+                                await self._post_error_notification(
                                     message=f"Access denied for the provided Ghostwriter API token! Check if it is valid, update your Mythic Sync configuration, and restart the service.",
-                                    source="mythic_sync_reject",
-                                    level="warning"
+                                    source="mythic_sync_access_denied",
                                 )
                                 await asyncio.sleep(self.wait_timeout)
                                 continue
                             if payload["extensions"]["code"] == "postgres-error":
                                 mythic_sync_log.error(
                                     "Ghostwriter's database rejected the query! Check if your configured log ID is correct.")
-                                await mythic.send_event_log_message(
-                                    mythic=self.mythic_instance,
+                                await self._post_error_notification(
                                     message=f"Ghostwriter's database rejected the query! Check if your configured log ID ({self.GHOSTWRITER_OPLOG_ID}) is correct.",
                                     source="mythic_sync_reject",
-                                    level="warning"
                                 )
                     await asyncio.sleep(self.wait_timeout)
                     continue
@@ -304,14 +302,14 @@ class MythicSync:
                     "Exception occurred while trying to post the query to Ghostwriter! Trying again in %s seconds...",
                     self.wait_timeout
                 )
-                await self._post_error_notification(f"MythicSync:\nException occurred while trying to post the query to Ghostwriter!\n{exc}")
+                await self._post_error_notification(
+                    f"MythicSync:\nException occurred while trying to post the query to Ghostwriter!\n{exc}")
                 await asyncio.sleep(self.wait_timeout)
                 continue
 
     async def _check_token(self) -> None:
         """Send a `whoami` query to Ghostwriter to check authentication and token expiration."""
         whoami = await self._execute_query(self.whoami_query)
-
 
         # Check if the token will expire within 24 hours
         now = datetime.now(timezone.utc)
@@ -321,12 +319,10 @@ class MythicSync:
             expiry = datetime.fromisoformat(whoami["whoami"]["expires"])
             if expiry - now < timedelta(hours=24):
                 mythic_sync_log.debug(f"The provided Ghostwriter API token expires in less than 24 hours ({expiry})!")
-                await mythic.send_event_log_message(
-                    mythic=self.mythic_instance,
+                await self._post_error_notification(
                     message=f"The provided Ghostwriter API token expires in less than 24 hours ({expiry})!",
-                    source="mythic_sync",
-                    level="warning"
-                )
+                    source="mythic_sync_token_expiration",
+                    )
         await mythic.send_event_log_message(
             mythic=self.mythic_instance,
             message=f"Mythic Sync has successfully authenticated to Ghostwriter. Your configured token expires at: {expiry}",
@@ -353,16 +349,16 @@ class MythicSync:
         )
         return
 
-    async def _post_error_notification(self, message: str = None) -> None:
+    async def _post_error_notification(self, message: str = None, source: str = None) -> None:
         """Send an error notification to Mythic's notification center."""
         if message is None:
             message = "Mythic Sync logged an error and may need attention to continue syncing.\n" \
                       "Run this command to review the issue:\n\n" \
                       "  sudo ./mythic-cli logs mythic_sync"
-        mythic_sync_log.info("Submitting an error notification to Mythic's notification center")
+        mythic_sync_log.info("Submitting an error notification to Mythic's notification center: %s", message)
         await mythic.send_event_log_message(mythic=self.mythic_instance,
                                             message=message,
-                                            source="mythic_sync",
+                                            source="mythic_sync" if source is None else source,
                                             level="warning")
         return
 
@@ -392,7 +388,8 @@ class MythicSync:
             hostname = message["callback"]["host"]
             source_ip = await self._get_sorted_ips(message["callback"]["ip"])
             gw_message["sourceIp"] = f"{hostname} ({source_ip})"
-            gw_message["description"] = f"PID: {message['callback']['pid']}, Callback: {message['callback']['display_id']}"
+            gw_message[
+                "description"] = f"PID: {message['callback']['pid']}, Callback: {message['callback']['display_id']}"
             gw_message["userContext"] = message["callback"]["user"]
             gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
             gw_message['entry_identifier'] = message["agent_task_id"]
@@ -419,7 +416,8 @@ class MythicSync:
             gw_message["comments"] = f"New Callback {message['display_id']}"
             integrity = self.integrity_levels[message["integrity_level"]]
             opsys = message['os'].replace("\n", ", ")
-            gw_message["description"] = f"Computer: {message['host']}, Integrity Level: {integrity}, Process: {message['process_name']}, PID: {message['pid']}, User: {message['user']}, Domain: {message['domain']}, OS: {opsys}"
+            gw_message[
+                "description"] = f"Computer: {message['host']}, Integrity Level: {integrity}, Process: {message['process_name']}, PID: {message['pid']}, User: {message['user']}, Domain: {message['domain']}, OS: {opsys}"
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
             source_ip = await self._get_sorted_ips(message["ip"])
             gw_message["sourceIp"] = f"{message['host']} ({source_ip})"
@@ -470,7 +468,8 @@ class MythicSync:
                     "entry_identifier": gw_message['entry_identifier'],
                 })
                 if query_result and "oplogEntry" in query_result and len(query_result["oplogEntry"]) > 0:
-                    mythic_sync_log.info(f"Duplicate entry found based on entryIdentifier, {gw_message['entry_identifier']}, not sending")
+                    mythic_sync_log.info(
+                        f"Duplicate entry found based on entryIdentifier, {gw_message['entry_identifier']}, not sending")
                     # save off id of oplog entry with this gw_message['entry_identifier'] so we don't try to send it again
                     self.rconn.set(entry_id, query_result["oplogEntry"][0]["id"])
                     return
@@ -708,5 +707,6 @@ async def scripting():
             )
         finally:
             await mythic_sync.client.close_async()
+
 
 asyncio.run(scripting())
