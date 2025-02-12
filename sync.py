@@ -325,7 +325,7 @@ class MythicSync:
                 await self._post_error_notification(
                     message=f"The provided Ghostwriter API token expires in less than 24 hours ({expiry})!",
                     source="mythic_sync_token_expiration",
-                    )
+                )
         await mythic.send_event_log_message(
             mythic=self.mythic_instance,
             message=f"Mythic Sync has successfully authenticated to Ghostwriter. Your configured token expires at: {expiry}",
@@ -384,7 +384,10 @@ class MythicSync:
                 end_date = datetime.strptime(
                     message["status_timestamp_processed"], "%Y-%m-%dT%H:%M:%S.%f")
                 gw_message["endDate"] = end_date.strftime("%Y-%m-%d %H:%M:%S")
-            gw_message["command"] = f"{message['command_name']} {message['original_params']}"
+            if message['command'] is not None:
+                gw_message["command"] = f"{message['command']['cmd']} {message['original_params']}"
+            else:
+                gw_message["command"] = f"{message['command_name']} {message['original_params']}"
             gw_message["comments"] = message["comment"] if message["comment"] is not None else ""
             gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
             gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
@@ -532,6 +535,9 @@ class MythicSync:
         command_name
         original_params
         comment
+        command {
+            cmd
+        }
         operator {
             username
         }
