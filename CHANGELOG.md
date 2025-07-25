@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.8] - 25 July 2025
+
+### Changed
+
+* Using Ghostwriter's new tags and setTags GraphQL calls, sync over Mythic's tagging to oplog entries
+  * Mythic-based tags are prefixed with `mythic:`
+  
 ## [3.0.7] - 27 June 2024
 
 ### Changed

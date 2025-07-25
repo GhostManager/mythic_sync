@@ -20,7 +20,7 @@ from graphql.error.graphql_error import GraphQLError
 # Mythic Sync Libraries
 from mythic import mythic, mythic_classes
 
-VERSION = "3.0.7"
+VERSION = "3.0.8"
 
 # Logging configuration
 # Level applies to all loggers, including ``gql`` Transport and Client loggers
@@ -145,6 +145,28 @@ class MythicSync:
                 extraFields: $extraFields
             }) {
                 returning { id }
+            }
+        }
+        """
+    )
+
+    # Query for tags on oplog entry
+    query_oplog_entry_tags = gql(
+        """
+        query GetOplogEntryTags($oplog_entry_id: bigint!){
+            tags(id: $oplog_entry_id, model: "oplog_entry"){
+                tags
+            }
+        }
+        """
+    )
+
+    # Mutation to create tagged entry
+    set_tags_mutation = gql(
+        """
+        mutation AddTagToOplogEvent($oplog_entry_id: bigint!, $tags: [String!]!){
+            setTags(id: $oplog_entry_id, model: "oplog_entry", tags: $tags){
+                tags
             }
         }
         """
@@ -399,6 +421,7 @@ class MythicSync:
             gw_message["userContext"] = message["callback"]["user"]
             gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
             gw_message['entry_identifier'] = message["agent_task_id"]
+            gw_message['tags'] = [f"mythic:{x['tagtype']['name']}" for x in message['tags']]
             gw_message['extraFields'] = {}
         except Exception:
             mythic_sync_log.exception(
@@ -440,6 +463,29 @@ class MythicSync:
             )
         return gw_message
 
+    async def _handleTaskTags(self, tags: list, entry_id: str) -> None:
+        """
+        Process a Mythic Task's tags for an oplog entry
+        :param message:
+        :return:
+        """
+        # given an oplog_entry id, fetch its current tags, merge it with message['tags']
+        currentTags = await self._execute_query(self.query_oplog_entry_tags, {
+            "oplog_entry_id": entry_id,
+        })
+        updatedTags = []
+        for currentTag in currentTags['tags']['tags']:
+            if currentTag.startswith("mythic:"):
+                if currentTag in tags:
+                    updatedTags.append(currentTag)
+            else:
+                updatedTags.append(currentTag)
+        for currentTag in tags:
+            updatedTags.append(currentTag)
+        await self._execute_query(self.set_tags_mutation, {
+            "oplog_entry_id": entry_id,
+            "tags": updatedTags
+        })
     async def _create_entry(self, message: dict) -> None:
         """
         Create an entry for a Mythic task in Ghostwriter's ``OplogEntry`` model. Uses the
@@ -465,7 +511,7 @@ class MythicSync:
                 "Failed to create an entry for task, no `agent_task_id` or `agent_callback_id` found! Message "
                 "contents: %s", message
             )
-
+        tags = gw_message.pop("tags", [])
         if entry_id != "" and 'entry_identifier' in gw_message:
             result = None
             try:
@@ -478,11 +524,13 @@ class MythicSync:
                         f"Duplicate entry found based on entryIdentifier, {gw_message['entry_identifier']}, not sending")
                     # save off id of oplog entry with this gw_message['entry_identifier'] so we don't try to send it again
                     self.rconn.set(entry_id, query_result["oplogEntry"][0]["id"])
+                    await self._handleTaskTags(tags, query_result["oplogEntry"][0]["id"])
                     return
                 result = await self._execute_query(self.insert_query, gw_message)
                 if result and "insert_oplogEntry" in result:
                     # JSON response example: `{'data': {'insert_oplogEntry': {'returning': [{'id': 192}]}}}`
                     self.rconn.set(entry_id, result["insert_oplogEntry"]["returning"][0]["id"])
+                    await self._handleTaskTags(tags, result["insert_oplogEntry"]["returning"][0]["id"])
                 else:
                     mythic_sync_log.info(
                         "Did not receive a response with data from Ghostwriter's GraphQL API! Response: %s",
@@ -510,6 +558,7 @@ class MythicSync:
         mythic_sync_log.debug(f"Updating task: {message['agent_task_id']} - {message['id']} : {entry_id}")
         gw_message = await self._mythic_task_to_ghostwriter_message(message)
         gw_message["id"] = entry_id
+        tags = gw_message.pop("tags", [])
         try:
             result = await self._execute_query(self.update_query, gw_message)
             if not result or "update_oplogEntry" not in result:
@@ -517,6 +566,8 @@ class MythicSync:
                     "Did not receive a response with data from Ghostwriter's GraphQL API! Response: %s",
                     result
                 )
+            else:
+                await self._handleTaskTags(tags, entry_id)
         except Exception:
             mythic_sync_log.exception("Exception encountered while trying to update task log entry in Ghostwriter!")
 
@@ -540,6 +591,11 @@ class MythicSync:
         }
         operator {
             username
+        }
+        tags {
+            tagtype {
+                name
+            }
         }
         callback {
             host
