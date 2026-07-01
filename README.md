@@ -17,7 +17,7 @@ The current version of `mythic_sync` requires Mythic >=v3.0.0 and Ghostwriter >=
 To authenticate to your instances of Mythic and Ghostwriter, you will need this information handy:
 
 * Ghostwriter URL
-* Ghostwriter GraphQL API token
+* Ghostwriter Service Token
 * Ghostwriter log ID
 * Mythic credentials
 
@@ -25,9 +25,9 @@ To authenticate to your instances of Mythic and Ghostwriter, you will need this 
 
 You can get your log's ID by opening the log's webpage and looking at the top of the page. You'll see "Oplog ID #" followed by a number. That's the ID number you need.
 
-To generate an API token for your Ghostwriter instance, visit your user profile and click on the "Create" button in the "API Tokens" section.
+You'll want a Ghostwriter Service Token (prefixed with `gwst_`) with access to your target log ID. If you don't have one yet, you can create a new token under your profile.
 
-The token must be attached to an account that has access to the project containing your target oplog. You can read more about the [authorization controls on the Ghostwriter wiki](https://www.ghostwriter.wiki/features/graphql-api/authorization).
+Read more about tokens and how to create and manage them here: [https://www.ghostwriter.wiki/features/operation-logs/setting-up-automated-logging](https://www.ghostwriter.wiki/features/operation-logs/setting-up-automated-logging)
 
 ### Execute via Mythic 3.0+ and `mythic-cli`
 
