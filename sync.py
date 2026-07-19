@@ -54,10 +54,19 @@ class MythicSync:
     wait_timeout = 5
     max_retry_timeout = 300
 
-    # Redis keys and polling interval for independently retried tag updates
-    tag_retry_data_key = "mythic_sync:pending_tag_updates:data"
-    tag_retry_schedule_key = "mythic_sync:pending_tag_updates:schedule"
+    # Polling interval for independently retried tag updates
     tag_retry_poll_interval = 5
+    legacy_tag_retry_data_key = "mythic_sync:pending_tag_updates:data"
+    legacy_tag_retry_schedule_key = "mythic_sync:pending_tag_updates:schedule"
+
+    # Variables which identify a failed query without exposing commands or other sensitive content
+    diagnostic_variable_names = {
+        "entry_identifier",
+        "id",
+        "oplog",
+        "oplog_entry_id",
+        "oplogId",
+    }
 
     # Query for the whoami expiration checks
     whoami_query = gql(
@@ -84,12 +93,16 @@ class MythicSync:
     # Query for the first log sent after initialization
     initial_query = gql(
         """
-        mutation InitializeMythicSync ($oplogId: bigint!, $description: String!, $server: String!, $extraFields: jsonb!) {
+        mutation InitializeMythicSync (
+            $oplogId: bigint!, $description: String!, $server: String!, $entry_identifier: String!,
+            $extraFields: jsonb!
+        ) {
             insert_oplogEntry(objects: {
                 oplog: $oplogId,
                 description: $description,
                 sourceIp: $server,
                 tool: "Mythic",
+                entryIdentifier: $entry_identifier,
                 extraFields: $extraFields
             }) {
                 returning { id }
@@ -202,8 +215,9 @@ class MythicSync:
     MYTHIC_URL = f"https://{MYTHIC_IP}:{MYTHIC_PORT}"
 
     # Redis server
-    REDIS_HOSTNAME = "127.0.0.1"
-    REDIS_PORT = 6379
+    REDIS_HOSTNAME = os.environ.get("REDIS_HOSTNAME", "127.0.0.1")
+    REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+    REDIS_DB = int(os.environ.get("REDIS_DB", "1"))
 
     # Ghostwriter server authentication
     GHOSTWRITER_API_KEY = os.environ.get("GHOSTWRITER_API_KEY")
@@ -229,7 +243,6 @@ class MythicSync:
         "Authorization": f"Bearer {GHOSTWRITER_API_KEY}",
         "Content-Type": "application/json"
     }
-    last_error_timestamp = datetime.utcnow() - timedelta(hours=1)
     last_error_delta = timedelta(minutes=30)
     session = None
     client = None
@@ -237,6 +250,9 @@ class MythicSync:
 
     def __init__(self):
         self._notification_timestamps = {}
+        self.redis_namespace = f"mythic_sync:{self.GHOSTWRITER_OPLOG_ID}:{self.MYTHIC_IP}"
+        self.tag_retry_data_key = f"{self.redis_namespace}:pending_tag_updates:data"
+        self.tag_retry_schedule_key = f"{self.redis_namespace}:pending_tag_updates:schedule"
 
     async def initialize(self) -> None:
         """
@@ -258,16 +274,94 @@ class MythicSync:
         await self._check_token()
         await self._create_initial_entry()
 
-    async def _get_sorted_ips(self, ip: str) -> str:
-        source_ips = json.loads(ip)
-        # account for CIDR notation (ex: 192.168.0.123/24) in IPs list to make sure we only get the actual IP
-        source_ips = [x.split("/")[0] for x in source_ips if x != ""]
-        source_ipv4 = []
-        for i in range(len(source_ips)):
-            new_address = ipaddress.ip_address(source_ips[i])
-            if isinstance(new_address, ipaddress.IPv4Address):
-                source_ipv4.append(new_address)
-        return ", ".join(str(x) for x in sorted(source_ipv4))
+    async def _get_sorted_ips(self, ip: object) -> str:
+        """Normalize a Mythic IP value into a sorted IPv4/IPv6 string."""
+        if not ip:
+            return ""
+
+        source_ips = ip
+        if isinstance(ip, str):
+            try:
+                source_ips = json.loads(ip)
+            except json.JSONDecodeError:
+                source_ips = [ip]
+        if isinstance(source_ips, str):
+            source_ips = [source_ips]
+        if not isinstance(source_ips, (list, tuple, set)):
+            raise ValueError(f"Unsupported Mythic IP value: {source_ips!r}")
+
+        addresses = set()
+        for source_ip in source_ips:
+            source_ip = str(source_ip).strip()
+            if not source_ip:
+                continue
+            try:
+                addresses.add(ipaddress.ip_address(source_ip.split("/", 1)[0]))
+            except ValueError:
+                mythic_sync_log.warning("Ignoring invalid IP address reported by Mythic: %r", source_ip)
+
+        return ", ".join(
+            str(address) for address in sorted(addresses, key=lambda address: (address.version, int(address)))
+        )
+
+    @staticmethod
+    def _parse_mythic_timestamp(value: str) -> str:
+        """Normalize Mythic timestamps while retaining any timezone information."""
+        if not value:
+            return ""
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        return datetime.fromisoformat(normalized).isoformat()
+
+    def _redis_entry_key(self, entry_identifier: str) -> str:
+        """Return a Redis mapping key scoped to this Mythic server and Ghostwriter oplog."""
+        return f"{self.redis_namespace}:entry:{entry_identifier}"
+
+    def _get_cached_entry_id(self, entry_identifier: str):
+        """Read a scoped entry mapping, migrating the legacy raw key when encountered."""
+        scoped_key = self._redis_entry_key(entry_identifier)
+        entry_id = self.rconn.get(scoped_key)
+        if entry_id is not None:
+            return entry_id
+
+        legacy_entry_id = self.rconn.get(entry_identifier)
+        if legacy_entry_id is not None:
+            pipeline = self.rconn.pipeline(transaction=True)
+            pipeline.set(scoped_key, legacy_entry_id)
+            pipeline.delete(entry_identifier)
+            pipeline.execute()
+            mythic_sync_log.info("Migrated legacy Redis mapping for %s", entry_identifier)
+        return legacy_entry_id
+
+    def _set_cached_entry_id(self, entry_identifier: str, ghostwriter_entry_id: str) -> None:
+        self.rconn.set(self._redis_entry_key(entry_identifier), ghostwriter_entry_id)
+
+    def _delete_cached_entry_id(self, entry_identifier: str) -> None:
+        pipeline = self.rconn.pipeline(transaction=True)
+        pipeline.delete(self._redis_entry_key(entry_identifier))
+        pipeline.delete(entry_identifier)
+        pipeline.execute()
+
+    def _migrate_legacy_tag_queue(self) -> int:
+        """Move pre-namespace pending tag jobs into this deployment's scoped queue."""
+        legacy_payloads = self.rconn.hgetall(self.legacy_tag_retry_data_key)
+        if not legacy_payloads:
+            return 0
+
+        legacy_schedule = dict(
+            self.rconn.zrange(self.legacy_tag_retry_schedule_key, 0, -1, withscores=True)
+        )
+        pipeline = self.rconn.pipeline(transaction=True)
+        for entry_id, payload in legacy_payloads.items():
+            pipeline.hset(self.tag_retry_data_key, entry_id, payload)
+            pipeline.zadd(
+                self.tag_retry_schedule_key,
+                {entry_id: legacy_schedule.get(entry_id, time.time())},
+            )
+        pipeline.delete(self.legacy_tag_retry_data_key)
+        pipeline.delete(self.legacy_tag_retry_schedule_key)
+        pipeline.execute()
+        mythic_sync_log.info("Migrated %s legacy pending tag update(s)", len(legacy_payloads))
+        return len(legacy_payloads)
 
     @staticmethod
     def _get_query_context(query: DocumentNode, variable_values: dict = None) -> tuple[str, str]:
@@ -278,7 +372,11 @@ class MythicSync:
                 operation_name = definition.name.value
                 break
 
-        variables = json.dumps(variable_values or {}, default=str, sort_keys=True)
+        diagnostic_variables = {
+            key: value if key in MythicSync.diagnostic_variable_names else "<redacted>"
+            for key, value in (variable_values or {}).items()
+        }
+        variables = json.dumps(diagnostic_variables, default=str, sort_keys=True)
         return operation_name, variables
 
     async def _wait_for_query_retry(self, operation_name: str, retry_delay: float) -> float:
@@ -414,7 +512,11 @@ class MythicSync:
         if whoami["whoami"]["expires"] == "Never":
             expiry = "Never"
         else:
-            expiry = datetime.fromisoformat(whoami["whoami"]["expires"])
+            expiry_value = whoami["whoami"]["expires"]
+            expiry_value = expiry_value[:-1] + "+00:00" if expiry_value.endswith("Z") else expiry_value
+            expiry = datetime.fromisoformat(expiry_value)
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
             if expiry - now < timedelta(hours=24):
                 mythic_sync_log.debug(f"The provided Ghostwriter API token expires in less than 24 hours ({expiry})!")
                 await self._post_error_notification(
@@ -429,19 +531,34 @@ class MythicSync:
         )
 
     async def _create_initial_entry(self) -> None:
-        """Send the initial log entry to Ghostwriter's Oplog."""
+        """Send one idempotent initialization entry to Ghostwriter's oplog."""
         mythic_sync_log.info("Sending the initial Ghostwriter log entry")
-        variable_values = {
-            "oplogId": self.GHOSTWRITER_OPLOG_ID,
-            "description": f"Initial entry from mythic_sync at: {self.MYTHIC_IP}. If you're seeing this then oplog "
-                           f"syncing is working for this C2 server!",
-            "server": f"Mythic Server ({self.MYTHIC_IP})",
-            "extraFields": {}
-        }
-        await self._execute_query(self.initial_query, variable_values)
+        entry_identifier = f"mythic_sync:initial:{self.MYTHIC_IP}"
+        existing_entry = await self._execute_query(
+            self.entry_identifier_query,
+            {
+                "oplog": self.GHOSTWRITER_OPLOG_ID,
+                "entry_identifier": entry_identifier,
+            },
+        )
+        if existing_entry.get("oplogEntry", []):
+            mythic_sync_log.info(
+                "Ghostwriter initialization entry already exists for Mythic server %s",
+                self.MYTHIC_IP,
+            )
+        else:
+            variable_values = {
+                "oplogId": self.GHOSTWRITER_OPLOG_ID,
+                "description": f"Initial entry from mythic_sync at: {self.MYTHIC_IP}. If you're seeing this then "
+                               "oplog syncing is working for this C2 server!",
+                "server": f"Mythic Server ({self.MYTHIC_IP})",
+                "entry_identifier": entry_identifier,
+                "extraFields": {},
+            }
+            await self._execute_query(self.initial_query, variable_values)
         await mythic.send_event_log_message(
             mythic=self.mythic_instance,
-            message="Mythic Sync successfully posted its initial log entry to Ghostwriter",
+            message="Mythic Sync successfully confirmed its initialization entry in Ghostwriter",
             source="mythic_sync",
             level="info"
         )
@@ -488,37 +605,29 @@ class MythicSync:
         ``message``
             The message dictionary to be converted
         """
-        gw_message = {}
-        try:
-            if message["status_timestamp_submitted"] is not None:
-                start_date = datetime.strptime(
-                    message["status_timestamp_submitted"], "%Y-%m-%dT%H:%M:%S.%f")
-                gw_message["startDate"] = start_date.strftime("%Y-%m-%d %H:%M:%S")
-            if message["status_timestamp_processed"] is not None:
-                end_date = datetime.strptime(
-                    message["status_timestamp_processed"], "%Y-%m-%dT%H:%M:%S.%f")
-                gw_message["endDate"] = end_date.strftime("%Y-%m-%d %H:%M:%S")
-            if message['command'] is not None:
-                gw_message["command"] = f"{message['command']['cmd']} {message['original_params']}"
-            else:
-                gw_message["command"] = f"{message['command_name']} {message['original_params']}"
-            gw_message["comments"] = message["comment"] if message["comment"] is not None else ""
-            gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
-            gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
-            hostname = message["callback"]["host"]
-            source_ip = await self._get_sorted_ips(message["callback"]["ip"])
-            gw_message["sourceIp"] = f"{hostname} ({source_ip})"
-            gw_message[
-                "description"] = f"PID: {message['callback']['pid']}, Callback: {message['callback']['display_id']}"
-            gw_message["userContext"] = message["callback"]["user"]
-            gw_message["tool"] = message["callback"]["payload"]["payloadtype"]["name"]
-            gw_message['entry_identifier'] = message["agent_task_id"]
-            gw_message['tags'] = [f"mythic:{x['tagtype']['name']}" for x in message['tags']]
-            gw_message['extraFields'] = {}
-        except Exception:
-            mythic_sync_log.exception(
-                "Encountered an exception while processing Mythic's message into a message for Ghostwriter"
-            )
+        callback = message["callback"]
+        hostname = callback["host"]
+        source_ip = await self._get_sorted_ips(callback.get("ip"))
+        command = message.get("command")
+        command_name = command["cmd"] if command is not None else message["command_name"]
+
+        gw_message = {
+            "command": f"{command_name} {message.get('original_params', '')}".rstrip(),
+            "comments": message.get("comment") or "",
+            "operatorName": (message.get("operator") or {}).get("username", ""),
+            "oplog": self.GHOSTWRITER_OPLOG_ID,
+            "sourceIp": f"{hostname} ({source_ip})" if source_ip else hostname,
+            "description": f"PID: {callback['pid']}, Callback: {callback['display_id']}",
+            "userContext": callback["user"],
+            "tool": callback["payload"]["payloadtype"]["name"],
+            "entry_identifier": message["agent_task_id"],
+            "tags": [f"mythic:{tag['tagtype']['name']}" for tag in message.get("tags", [])],
+            "extraFields": {},
+        }
+        if message.get("status_timestamp_submitted"):
+            gw_message["startDate"] = self._parse_mythic_timestamp(message["status_timestamp_submitted"])
+        if message.get("status_timestamp_processed"):
+            gw_message["endDate"] = self._parse_mythic_timestamp(message["status_timestamp_processed"])
         return gw_message
 
     async def _mythic_callback_to_ghostwriter_message(self, message: dict) -> dict:
@@ -530,30 +639,27 @@ class MythicSync:
         ``message``
             The message dictionary to be converted
         """
-        gw_message = {}
-        try:
-            callback_date = datetime.strptime(message["init_callback"], "%Y-%m-%dT%H:%M:%S.%f")
-            gw_message["startDate"] = callback_date.strftime("%Y-%m-%d %H:%M:%S")
-            gw_message["comments"] = f"New Callback {message['display_id']}"
-            integrity = self.integrity_levels[message["integrity_level"]]
-            opsys = message['os'].replace("\n", ", ")
-            gw_message[
-                "description"] = f"Computer: {message['host']}, Integrity Level: {integrity}, Process: {message['process_name']}, PID: {message['pid']}, User: {message['user']}, Domain: {message['domain']}, OS: {opsys}"
-            gw_message["operatorName"] = message["operator"]["username"] if message["operator"] is not None else ""
-            source_ip = await self._get_sorted_ips(message["ip"])
-            gw_message["sourceIp"] = f"{message['host']} ({source_ip})"
-            gw_message["userContext"] = message["user"]
-            gw_message["tool"] = message["payload"]["payloadtype"]["name"]
-            gw_message["oplog"] = self.GHOSTWRITER_OPLOG_ID
-            gw_message['entry_identifier'] = message["agent_callback_id"]
-            gw_message['extraFields'] = {}
-            gw_message["command"] = ""
-        except Exception:
-            mythic_sync_log.exception(
-                "Encountered an exception while processing Mythic's message into a message for Ghostwriter! Received message: %s",
-                message
-            )
-        return gw_message
+        source_ip = await self._get_sorted_ips(message.get("ip"))
+        integrity_level = message.get("integrity_level")
+        integrity = self.integrity_levels.get(integrity_level, f"Unknown ({integrity_level})")
+        opsys = (message.get("os") or "").replace("\n", ", ")
+        hostname = message["host"]
+        return {
+            "startDate": self._parse_mythic_timestamp(message["init_callback"]),
+            "comments": f"New Callback {message['display_id']}",
+            "description": (
+                f"Computer: {hostname}, Integrity Level: {integrity}, Process: {message['process_name']}, "
+                f"PID: {message['pid']}, User: {message['user']}, Domain: {message['domain']}, OS: {opsys}"
+            ),
+            "operatorName": (message.get("operator") or {}).get("username", ""),
+            "sourceIp": f"{hostname} ({source_ip})" if source_ip else hostname,
+            "userContext": message["user"],
+            "tool": message["payload"]["payloadtype"]["name"],
+            "oplog": self.GHOSTWRITER_OPLOG_ID,
+            "entry_identifier": message["agent_callback_id"],
+            "extraFields": {},
+            "command": "",
+        }
 
     def _queue_task_tags(self, tags: list, entry_id: str) -> None:
         """Persist the latest desired Mythic tags for asynchronous processing."""
@@ -683,19 +789,24 @@ class MythicSync:
         """
         entry_id = ""
         gw_message = {}
-        if "agent_task_id" in message:
-            entry_id = message["agent_task_id"]
-            mythic_sync_log.debug(f"Adding task: {message['agent_task_id']}")
-            gw_message = await self._mythic_task_to_ghostwriter_message(message)
-        elif "agent_callback_id" in message:
-            entry_id = message["agent_callback_id"]
-            mythic_sync_log.debug(f"Adding callback: {message['agent_callback_id']}")
-            gw_message = await self._mythic_callback_to_ghostwriter_message(message)
-        else:
-            mythic_sync_log.error(
-                "Failed to create an entry for task, no `agent_task_id` or `agent_callback_id` found! Message "
-                "contents: %s", message
-            )
+        try:
+            if "agent_task_id" in message:
+                entry_id = message["agent_task_id"]
+                mythic_sync_log.debug(f"Adding task: {message['agent_task_id']}")
+                gw_message = await self._mythic_task_to_ghostwriter_message(message)
+            elif "agent_callback_id" in message:
+                entry_id = message["agent_callback_id"]
+                mythic_sync_log.debug(f"Adding callback: {message['agent_callback_id']}")
+                gw_message = await self._mythic_callback_to_ghostwriter_message(message)
+            else:
+                raise ValueError(
+                    "Message has no `agent_task_id` or `agent_callback_id`; received keys: "
+                    f"{sorted(message)}"
+                )
+        except Exception:
+            mythic_sync_log.exception("Failed to convert Mythic event %s for Ghostwriter", entry_id or "unknown")
+            await self._post_error_notification(source="mythic_sync_conversion")
+            raise
         tags = gw_message.pop("tags", [])
         if entry_id != "" and 'entry_identifier' in gw_message:
             result = None
@@ -709,14 +820,14 @@ class MythicSync:
                     mythic_sync_log.info(
                         f"Duplicate entry found based on entryIdentifier, {gw_message['entry_identifier']}, not sending")
                     # save off id of oplog entry with this gw_message['entry_identifier'] so we don't try to send it again
-                    self.rconn.set(entry_id, ghostwriter_entry_id)
+                    self._set_cached_entry_id(entry_id, ghostwriter_entry_id)
                     self._queue_task_tags(tags, ghostwriter_entry_id)
                     return
                 result = await self._execute_query(self.insert_query, gw_message)
                 ghostwriter_entry_id = self._get_returning_entry_id(result, "insert_oplogEntry")
                 if ghostwriter_entry_id:
                     # JSON response example: `{'data': {'insert_oplogEntry': {'returning': [{'id': 192}]}}}`
-                    self.rconn.set(entry_id, ghostwriter_entry_id)
+                    self._set_cached_entry_id(entry_id, ghostwriter_entry_id)
                     self._queue_task_tags(tags, ghostwriter_entry_id)
                 else:
                     raise RuntimeError(
@@ -729,6 +840,7 @@ class MythicSync:
                     result,
                 )
                 await self._post_error_notification()
+                raise
 
     async def _update_entry(self, message: dict, entry_id: str) -> None:
         """
@@ -743,7 +855,15 @@ class MythicSync:
             The ID of the log entry to be updated
         """
         mythic_sync_log.debug(f"Updating task: {message['agent_task_id']} - {message['id']} : {entry_id}")
-        gw_message = await self._mythic_task_to_ghostwriter_message(message)
+        try:
+            gw_message = await self._mythic_task_to_ghostwriter_message(message)
+        except Exception:
+            mythic_sync_log.exception(
+                "Failed to convert Mythic task %s for a Ghostwriter update",
+                message["agent_task_id"],
+            )
+            await self._post_error_notification(source="mythic_sync_conversion")
+            raise
         gw_message["id"] = entry_id
         tags = gw_message.pop("tags", [])
         try:
@@ -759,7 +879,7 @@ class MythicSync:
                     mythic_entry_id,
                     gw_message["entry_identifier"],
                 )
-                self.rconn.delete(mythic_entry_id)
+                self._delete_cached_entry_id(mythic_entry_id)
 
                 query_result = await self._execute_query(
                     self.entry_identifier_query,
@@ -792,12 +912,13 @@ class MythicSync:
                             "Response: %s" % (stale_entry_id, insert_result)
                         )
 
-                self.rconn.set(mythic_entry_id, ghostwriter_entry_id)
+                self._set_cached_entry_id(mythic_entry_id, ghostwriter_entry_id)
 
             self._queue_task_tags(tags, ghostwriter_entry_id)
         except Exception:
             mythic_sync_log.exception("Exception encountered while trying to update task log entry in Ghostwriter!")
             await self._post_error_notification(source="mythic_sync_update_entry")
+            raise
 
     async def handle_task(self) -> None:
         """
@@ -843,14 +964,14 @@ class MythicSync:
                 mythic=self.mythic_instance, custom_return_attributes=custom_return_attributes,
         ):
             try:
-                entry_id = self.rconn.get(data["agent_task_id"])
+                entry_id = self._get_cached_entry_id(data["agent_task_id"])
             except Exception:
                 mythic_sync_log.exception(
-                    "Encountered an exception while connecting to Redis to fetch data! Data returned by Mythic: %s",
-                    data
+                    "Encountered an exception while fetching the Redis mapping for Mythic task %s",
+                    data.get("agent_task_id", "unknown"),
                 )
                 await self._post_error_notification()
-                continue
+                raise
             if entry_id is not None:
                 await self._update_entry(data, entry_id.decode())
             else:
@@ -912,15 +1033,35 @@ class MythicSync:
             return
 
     async def _wait_for_redis(self) -> None:
-        """Wait for a connection to be established with Mythic's Redis container."""
+        """Wait for Redis to accept commands and report the selected durable state."""
         while True:
             try:
-                self.rconn = redis.Redis(host=self.REDIS_HOSTNAME, port=self.REDIS_PORT, db=1)
+                self.rconn = redis.Redis(
+                    host=self.REDIS_HOSTNAME,
+                    port=self.REDIS_PORT,
+                    db=self.REDIS_DB,
+                    socket_connect_timeout=5,
+                    socket_timeout=5,
+                )
+                self.rconn.ping()
+                self._migrate_legacy_tag_queue()
+                pending_tags = self.rconn.hlen(self.tag_retry_data_key)
+                mythic_sync_log.info(
+                    "Connected to Redis at %s:%s database %s; %s tag update(s) pending",
+                    self.REDIS_HOSTNAME,
+                    self.REDIS_PORT,
+                    self.REDIS_DB,
+                    pending_tags,
+                )
                 return
             except Exception:
                 mythic_sync_log.exception(
-                    "Encountered an exception while trying to connect to Redis, %s:%s, trying again in %s seconds...",
-                    self.REDIS_HOSTNAME, self.REDIS_PORT, self.wait_timeout
+                    "Encountered an exception while trying to connect to Redis, %s:%s database %s, trying again "
+                    "in %s seconds...",
+                    self.REDIS_HOSTNAME,
+                    self.REDIS_PORT,
+                    self.REDIS_DB,
+                    self.wait_timeout,
                 )
                 await self._post_error_notification()
                 await asyncio.sleep(self.wait_timeout)
@@ -929,8 +1070,33 @@ class MythicSync:
     async def __wait_for_authentication(self) -> mythic_classes.Mythic:
         """Wait for authentication with Mythic to complete."""
         while True:
-            # If ``MYTHIC_API_KEY`` is not set in the environment, then authenticate with user credentials
-            if len(self.MYTHIC_API_KEY) == 0:
+            if self.MYTHIC_API_KEY:
+                mythic_sync_log.info(
+                    "Authenticating to Mythic, https://%s:%s, with a specified API key",
+                    self.MYTHIC_IP,
+                    self.MYTHIC_PORT,
+                )
+                try:
+                    mythic_instance = await mythic.login(
+                        apitoken=self.MYTHIC_API_KEY,
+                        server_ip=self.MYTHIC_IP,
+                        server_port=self.MYTHIC_PORT,
+                        ssl=True,
+                    )
+                    await mythic.get_me(mythic=mythic_instance)
+                except Exception as exc:
+                    mythic_sync_log.error(
+                        "Failed to authenticate with the Mythic API key: %s; trying again in %s seconds...",
+                        exc,
+                        self.wait_timeout,
+                    )
+                    await asyncio.sleep(self.wait_timeout)
+                    continue
+            else:
+                if not self.MYTHIC_USERNAME or not self.MYTHIC_PASSWORD:
+                    raise RuntimeError(
+                        "MYTHIC_API_KEY or both MYTHIC_USERNAME and MYTHIC_PASSWORD must be supplied"
+                    )
                 mythic_sync_log.info(
                     "Authenticating to Mythic, https://%s:%s, with username and password",
                     self.MYTHIC_IP, self.MYTHIC_PORT
@@ -943,40 +1109,22 @@ class MythicSync:
                         server_port=self.MYTHIC_PORT,
                         ssl=True,
                         timeout=-1)
-                except Exception as e:
+                except Exception as exc:
                     mythic_sync_log.error(
-                        "Encountered an exception while trying to authenticate to Mythic, trying again in %s seconds...",
+                        "Encountered an exception while trying to authenticate to Mythic: %s; trying again in %s "
+                        "seconds...",
+                        exc,
                         self.wait_timeout
                     )
                     await asyncio.sleep(self.wait_timeout)
                     continue
                 try:
                     await mythic.get_me(mythic=mythic_instance)
-                except Exception as e:
+                except Exception as exc:
                     mythic_sync_log.error(
-                        "Encountered an exception while trying to get user info from Mythic, trying again in %s seconds...",
-                        self.wait_timeout
-                    )
-                    await asyncio.sleep(self.wait_timeout)
-                    continue
-            elif self.MYTHIC_USERNAME == "" and self.MYTHIC_PASSWORD == "":
-                mythic_sync_log.error("You must supply a MYTHIC_USERNAME and MYTHIC_PASSWORD")
-                sys.exit(1)
-            else:
-                mythic_sync_log.info(
-                    "Authenticating to Mythic, https://%s:%s, with a specified API Key",
-                    self.MYTHIC_IP, self.MYTHIC_PORT
-                )
-                try:
-                    mythic_instance = await mythic.login(
-                        apitoken=self.MYTHIC_API_KEY,
-                        server_ip=self.MYTHIC_IP,
-                        server_port=self.MYTHIC_PORT,
-                        ssl=True)
-                    await mythic.get_me(mythic=mythic_instance)
-                except Exception as e:
-                    mythic_sync_log.error(
-                        "Failed to authenticate with the Mythic API token, trying again in %s seconds...",
+                        "Encountered an exception while trying to get user info from Mythic: %s; trying again in "
+                        "%s seconds...",
+                        exc,
                         self.wait_timeout
                     )
                     await asyncio.sleep(self.wait_timeout)
@@ -989,17 +1137,21 @@ async def scripting():
     mythic_sync = MythicSync()
     while True:
         await mythic_sync.initialize()
+        tasks = [
+            asyncio.create_task(mythic_sync.handle_task()),
+            asyncio.create_task(mythic_sync.handle_callback()),
+            asyncio.create_task(mythic_sync.retry_pending_tags()),
+        ]
         try:
-            _ = await asyncio.gather(
-                mythic_sync.handle_task(),
-                mythic_sync.handle_callback(),
-                mythic_sync.retry_pending_tags(),
-            )
+            await asyncio.gather(*tasks)
         except Exception:
             mythic_sync_log.exception(
                 "Encountered an exception while subscribing to tasks and responses, restarting..."
             )
         finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             await mythic_sync.client.close_async()
 
 if __name__ == "__main__":

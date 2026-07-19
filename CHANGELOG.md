@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+* Added an AOF-backed Redis queue so pending Ghostwriter tag updates survive `mythic_sync` restarts and service recreation, provided the Redis data volume is preserved.
+* Added Redis health checks, pending-job reporting, and automatic migration of legacy mappings and queued tag jobs.
+* Added GitHub Actions coverage for Python 3.10, Python 3.12, and production container builds, plus Dependabot configuration.
+
+### Changed
+
+* Made Redis hostname, port, and database configurable and scoped Redis mappings by Mythic server and Ghostwriter oplog.
+* Enabled Redis append-only persistence for embedded Mythic deployments and for the standalone Compose Redis service with a named volume. Raw Mythic subscription events remain live-streamed and are not persisted locally.
+* Updated supported dependency pins and moved the production container to Python 3.11 on Debian Bookworm.
+* Made Mythic timestamp and IP parsing tolerant of timezone variants, IPv6, plain strings, CIDR notation, and malformed individual addresses.
+* Limited GraphQL error context to identifiers while redacting commands, comments, and other potentially sensitive values.
+* Made the Ghostwriter initialization entry idempotent and corrected Mythic API-key authentication so user credentials are not also required.
+* Made subscription and tag worker shutdown explicit so worker failures cancel and await the remaining tasks before the Ghostwriter client closes.
+
+### Fixed
+
+* Fixed Redis startup checks reporting success without issuing a command.
+* Fixed conversion, creation, update, and Redis failures being swallowed after logging, which could allow processing to continue after an entry failed.
+* Fixed timezone-aware token expiration parsing for timestamps ending in `Z`.
+
 ## [3.1.0] - 18 July 2026
 
 ### Added

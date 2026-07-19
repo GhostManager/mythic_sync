@@ -61,12 +61,25 @@ After cloning repository, open the `settings.env` file and fill in the variables
 
 ```text
 MYTHIC_IP=10.10.1.100
+MYTHIC_PORT=7443
 MYTHIC_USERNAME=mythic_admin
 MYTHIC_PASSWORD=SuperSecretPassword
-GHOSTWRITER_API_KEY=eyJ0eXAiO...
+GHOSTWRITER_API_KEY=gwst_...
 GHOSTWRITER_URL=https://ghostwriter.mydomain.com
 GHOSTWRITER_OPLOG_ID=12
+REDIS_HOSTNAME=redis
+REDIS_PORT=6379
+REDIS_DB=1
 ```
+
+Set `MYTHIC_API_KEY` to authenticate with a Mythic API key instead of `MYTHIC_USERNAME` and
+`MYTHIC_PASSWORD`.
+
+The standalone Compose deployment stores entry mappings and pending tag updates in the named
+`mythic_sync_redis` volume. Redis append-only persistence is enabled so recreating the
+`mythic_sync` application container does not discard pending work. Mythic installations default
+to an embedded append-only Redis instance for compatibility; `REDIS_HOSTNAME`, `REDIS_PORT`, and
+`REDIS_DB` can select an external persistent Redis instance.
 
 Once the environment variables are set up, you can launch the service by using `docker-compose`:
 
@@ -88,9 +101,29 @@ If so, you're all set! Otherwise, check the logs from the docker container for e
 
 Ensure the host where `mythic_sync` is running has network access to the Ghostwriter and Mythic servers.
 
-`mythic_sync` uses an internal Redis database to sync what events have already been sent to Ghostwriter, avoiding duplicates.
+`mythic_sync` uses Redis to track events already sent to Ghostwriter and to retain pending tag
+updates. Redis mappings are scoped by Mythic server and Ghostwriter oplog. Legacy mappings and
+pending tag jobs are migrated automatically when first accessed after an upgrade.
 
-If the `mythic_sync` service goes down, it is safe to stand it back up and avoid duplicates as long as nothing has forcefully stopped Mythic's Redis container.
+At startup, the service logs the selected Redis endpoint and number of pending tag updates. A
+successful Redis client construction is not sufficient: the service waits for `PING` to succeed
+before subscribing to Mythic events.
+
+### Testing
+
+Run the unit suite in the production dependency image:
+
+```bash
+docker build -t mythic-sync-test .
+docker run --rm --entrypoint /opt/venv/bin/python \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  -v "$PWD:/workspace" -w /workspace \
+  mythic-sync-test -m unittest -v
+```
+
+The suite covers retries, stale and deleted entries, Redis migrations, tag queue processing,
+authentication selection, timestamp and IP normalization, initialization idempotency, and
+diagnostic redaction.
 
 ## References
 
