@@ -1,0 +1,6 @@
+.git
+.github
+.DS_Store
+__pycache__
+*.pyc
+test_sync.py
