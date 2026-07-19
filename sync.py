@@ -258,10 +258,19 @@ class MythicSync:
             new_address = ipaddress.ip_address(source_ips[i])
             if isinstance(new_address, ipaddress.IPv4Address):
                 source_ipv4.append(new_address)
-        source_ipv4 = [str(x) for x in sorted(source_ipv4)]
-        source_ips = source_ipv4
-        source_ip = json.dumps(source_ips)
-        return source_ip
+        return ", ".join(str(x) for x in sorted(source_ipv4))
+
+    @staticmethod
+    def _get_query_context(query: DocumentNode, variable_values: dict = None) -> tuple[str, str]:
+        """Return a GraphQL operation name and serialized representation of its variables."""
+        operation_name = "unnamed operation"
+        for definition in query.definitions:
+            if definition.name is not None:
+                operation_name = definition.name.value
+                break
+
+        variables = json.dumps(variable_values or {}, default=str, sort_keys=True)
+        return operation_name, variables
 
     async def _execute_query(self, query: DocumentNode, variable_values: dict = None) -> dict:
         """
@@ -274,6 +283,7 @@ class MythicSync:
         ``variable_values``
             The parameters to pass to the query
         """
+        operation_name, variables = self._get_query_context(query, variable_values)
         while True:
             try:
                 try:
@@ -282,44 +292,75 @@ class MythicSync:
                     return result
                 except TimeoutError:
                     mythic_sync_log.error(
-                        "Timeout occurred while trying to connect to Ghostwriter at %s",
-                        self.GHOSTWRITER_URL
+                        "Ghostwriter GraphQL operation '%s' timed out at %s with variables %s",
+                        operation_name,
+                        self.GHOSTWRITER_URL,
+                        variables,
                     )
                     await self._post_error_notification(
-                        f"MythicSync:\nTimeout occurred while trying to connect to Ghostwriter at {self.GHOSTWRITER_URL}", )
+                        f"MythicSync:\nGhostwriter GraphQL operation '{operation_name}' timed out at "
+                        f"{self.GHOSTWRITER_URL} with variables {variables}",
+                    )
                     await asyncio.sleep(self.wait_timeout)
                     continue
                 except TransportQueryError as e:
-                    mythic_sync_log.exception("Error encountered while fetching GraphQL schema: %s", e)
+                    mythic_sync_log.error(
+                        "Ghostwriter GraphQL operation '%s' failed with variables %s: %s",
+                        operation_name,
+                        variables,
+                        e,
+                    )
 
-                    payload = e.errors[0]
-                    if "extensions" in payload:
-                        if "code" in payload["extensions"]:
-                            if payload["extensions"]["code"] == "access-denied":
-                                mythic_sync_log.error(
-                                    "Access denied for the provided Ghostwriter API token! Check if it is valid, update your configuration, and restart")
-                                await self._post_error_notification(
-                                    message=f"Access denied for the provided Ghostwriter API token! Check if it is valid, update your Mythic Sync configuration, and restart the service.",
-                                    source="mythic_sync_access_denied",
-                                )
-                                await asyncio.sleep(self.wait_timeout)
-                                continue
-                            if payload["extensions"]["code"] == "postgres-error":
-                                mythic_sync_log.error(
-                                    "Ghostwriter's database rejected the query! Check if your configured log ID is correct.")
-                                await self._post_error_notification(
-                                    message=f"Ghostwriter's database rejected the query! Check if your configured log ID ({self.GHOSTWRITER_OPLOG_ID}) is correct.",
-                                    source="mythic_sync_reject",
-                                )
-                                await asyncio.sleep(self.wait_timeout)
-                                continue
+                    payload = next(
+                        (error for error in (e.errors or []) if isinstance(error, dict)),
+                        {},
+                    )
+                    code = payload.get("extensions", {}).get("code")
+                    if code == "access-denied":
+                        await self._post_error_notification(
+                            message=f"Access denied for Ghostwriter GraphQL operation '{operation_name}' with "
+                                    f"variables {variables}. Check that the provided service token is valid and "
+                                    "has the required permissions, then restart the service.",
+                            source="mythic_sync_access_denied",
+                        )
+                        await asyncio.sleep(self.wait_timeout)
+                        continue
+                    if code == "postgres-error":
+                        await self._post_error_notification(
+                            message=f"Ghostwriter's database rejected GraphQL operation '{operation_name}' with "
+                                    f"variables {variables}. Check if your configured log ID "
+                                    f"({self.GHOSTWRITER_OPLOG_ID}) is correct.",
+                            source="mythic_sync_reject",
+                        )
+                        await asyncio.sleep(self.wait_timeout)
+                        continue
+                    if code == "ModelDoesNotExist":
+                        await self._post_error_notification(
+                            message=f"Ghostwriter could not find or authorize the model requested by GraphQL "
+                                    f"operation '{operation_name}' with variables {variables}. The referenced "
+                                    "oplog entry may not exist, or the service token may not have permission to "
+                                    "access it.",
+                            source="mythic_sync_model_not_found",
+                        )
+                        await asyncio.sleep(self.wait_timeout)
+                        continue
                     await self._post_error_notification(
-                        f"MythicSync:\nError encountered while fetching GraphQL schema: {e}")
+                        f"MythicSync:\nGhostwriter GraphQL operation '{operation_name}' failed with variables "
+                        f"{variables}: {e}"
+                    )
                     await asyncio.sleep(self.wait_timeout)
                     continue
                 except GraphQLError as e:
-                    mythic_sync_log.exception("Error with GraphQL query: %s", e)
-                    await self._post_error_notification(f"MythicSync:\nError with GraphQL query: {e}")
+                    mythic_sync_log.exception(
+                        "Ghostwriter GraphQL operation '%s' failed with variables %s: %s",
+                        operation_name,
+                        variables,
+                        e,
+                    )
+                    await self._post_error_notification(
+                        f"MythicSync:\nGhostwriter GraphQL operation '{operation_name}' failed with variables "
+                        f"{variables}: {e}"
+                    )
                     await asyncio.sleep(self.wait_timeout)
                     continue
             except Exception as exc:
