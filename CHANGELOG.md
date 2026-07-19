@@ -7,14 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 18 July 2026
+
 ### Added
 
-* Added an AOF-backed Redis queue so pending Ghostwriter tag updates survive `mythic_sync` restarts and service recreation, provided the Redis data volume is preserved.
+* Added an AOF-backed Redis retry queue so Ghostwriter tag failures do not block log entry ingestion and pending jobs survive `mythic_sync` restarts and service recreation, provided the Redis data volume is preserved.
 * Added Redis health checks, pending-job reporting, and automatic migration of legacy mappings and queued tag jobs.
+* Added tests for query retries, stale entry reconciliation, deleted entry recreation, tag retries, and source IP formatting.
 * Added GitHub Actions coverage for Python 3.10, Python 3.12, and production container builds, plus Dependabot configuration.
 
 ### Changed
 
+* Changed Ghostwriter GraphQL retries to use exponential backoff with jitter, capped at five minutes.
+* Improved GraphQL error messages with the operation name and variables, including actionable context for ambiguous `ModelDoesNotExist` responses.
+* Changed source IP formatting from a JSON array to a sorted, comma-separated string.
 * Made Redis hostname, port, and database configurable and scoped Redis mappings by Mythic server and Ghostwriter oplog.
 * Enabled Redis append-only persistence for embedded Mythic deployments and for the standalone Compose Redis service with a named volume. Raw Mythic subscription events remain live-streamed and are not persisted locally.
 * Updated supported dependency pins and moved the production container to Python 3.11 on Debian Bookworm.
@@ -25,27 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+* Fixed stale Redis entry mappings by looking up the Ghostwriter entry by `entryIdentifier` and repairing the mapping or recreating a deleted entry.
+* Prevented repeated Mythic error notifications and notification delivery failures from interfering with GraphQL retries.
 * Fixed Redis startup checks reporting success without issuing a command.
 * Fixed conversion, creation, update, and Redis failures being swallowed after logging, which could allow processing to continue after an entry failed.
 * Fixed timezone-aware token expiration parsing for timestamps ending in `Z`.
-
-## [3.1.0] - 18 July 2026
-
-### Added
-
-* Added a Redis-backed retry queue for Ghostwriter oplog tag updates so tag failures do not block log entry ingestion.
-* Added tests for query retries, stale entry reconciliation, deleted entry recreation, tag retries, and source IP formatting.
-
-### Changed
-
-* Changed Ghostwriter GraphQL retries to use exponential backoff with jitter, capped at five minutes.
-* Improved GraphQL error messages with the operation name and variables, including actionable context for ambiguous `ModelDoesNotExist` responses.
-* Changed source IP formatting from a JSON array to a sorted, comma-separated string.
-
-### Fixed
-
-* Fixed stale Redis entry mappings by looking up the Ghostwriter entry by `entryIdentifier` and repairing the mapping or recreating a deleted entry.
-* Prevented repeated Mythic error notifications and notification delivery failures from interfering with GraphQL retries.
 
 ## [3.0.8] - 25 July 2025
 
