@@ -1,10 +1,13 @@
 # Standard Libraries
 import asyncio
+import builtins
 import ipaddress
 import json
 import logging
 import os
+import random
 import sys
+import time
 from asyncio.exceptions import TimeoutError
 from datetime import datetime, timedelta, timezone
 
@@ -49,6 +52,12 @@ class MythicSync:
 
     # How long to wait for a service to start before retrying an HTTP request
     wait_timeout = 5
+    max_retry_timeout = 300
+
+    # Redis keys and polling interval for independently retried tag updates
+    tag_retry_data_key = "mythic_sync:pending_tag_updates:data"
+    tag_retry_schedule_key = "mythic_sync:pending_tag_updates:schedule"
+    tag_retry_poll_interval = 5
 
     # Query for the whoami expiration checks
     whoami_query = gql(
@@ -227,7 +236,7 @@ class MythicSync:
     transport = AIOHTTPTransport(url=GRAPHQL_URL, timeout=10, headers=headers)
 
     def __init__(self):
-        pass
+        self._notification_timestamps = {}
 
     async def initialize(self) -> None:
         """
@@ -272,7 +281,26 @@ class MythicSync:
         variables = json.dumps(variable_values or {}, default=str, sort_keys=True)
         return operation_name, variables
 
-    async def _execute_query(self, query: DocumentNode, variable_values: dict = None) -> dict:
+    async def _wait_for_query_retry(self, operation_name: str, retry_delay: float) -> float:
+        """Sleep with jitter before a retry and return the next capped base delay."""
+        sleep_for = min(
+            self.max_retry_timeout,
+            random.uniform(retry_delay * 0.8, retry_delay * 1.2),
+        )
+        mythic_sync_log.warning(
+            "Retrying Ghostwriter GraphQL operation '%s' in %.1f seconds",
+            operation_name,
+            sleep_for,
+        )
+        await asyncio.sleep(sleep_for)
+        return min(self.max_retry_timeout, retry_delay * 2)
+
+    async def _execute_query(
+            self,
+            query: DocumentNode,
+            variable_values: dict = None,
+            retry: bool = True,
+    ) -> dict:
         """
         Execute a GraphQL query against the Ghostwriter server.
 
@@ -284,94 +312,98 @@ class MythicSync:
             The parameters to pass to the query
         """
         operation_name, variables = self._get_query_context(query, variable_values)
+        retry_delay = self.wait_timeout
         while True:
             try:
-                try:
-                    result = await self.session.execute(query, variable_values=variable_values)
-                    mythic_sync_log.debug("Successfully executed query with result: %s", result)
-                    return result
-                except TimeoutError:
-                    mythic_sync_log.error(
-                        "Ghostwriter GraphQL operation '%s' timed out at %s with variables %s",
-                        operation_name,
-                        self.GHOSTWRITER_URL,
-                        variables,
-                    )
-                    await self._post_error_notification(
-                        f"MythicSync:\nGhostwriter GraphQL operation '{operation_name}' timed out at "
-                        f"{self.GHOSTWRITER_URL} with variables {variables}",
-                    )
-                    await asyncio.sleep(self.wait_timeout)
-                    continue
-                except TransportQueryError as e:
-                    mythic_sync_log.error(
-                        "Ghostwriter GraphQL operation '%s' failed with variables %s: %s",
-                        operation_name,
-                        variables,
-                        e,
-                    )
-
-                    payload = next(
-                        (error for error in (e.errors or []) if isinstance(error, dict)),
-                        {},
-                    )
-                    code = payload.get("extensions", {}).get("code")
-                    if code == "access-denied":
-                        await self._post_error_notification(
-                            message=f"Access denied for Ghostwriter GraphQL operation '{operation_name}' with "
-                                    f"variables {variables}. Check that the provided service token is valid and "
-                                    "has the required permissions, then restart the service.",
-                            source="mythic_sync_access_denied",
-                        )
-                        await asyncio.sleep(self.wait_timeout)
-                        continue
-                    if code == "postgres-error":
-                        await self._post_error_notification(
-                            message=f"Ghostwriter's database rejected GraphQL operation '{operation_name}' with "
-                                    f"variables {variables}. Check if your configured log ID "
-                                    f"({self.GHOSTWRITER_OPLOG_ID}) is correct.",
-                            source="mythic_sync_reject",
-                        )
-                        await asyncio.sleep(self.wait_timeout)
-                        continue
-                    if code == "ModelDoesNotExist":
-                        await self._post_error_notification(
-                            message=f"Ghostwriter could not find or authorize the model requested by GraphQL "
-                                    f"operation '{operation_name}' with variables {variables}. The referenced "
-                                    "oplog entry may not exist, or the service token may not have permission to "
-                                    "access it.",
-                            source="mythic_sync_model_not_found",
-                        )
-                        await asyncio.sleep(self.wait_timeout)
-                        continue
-                    await self._post_error_notification(
-                        f"MythicSync:\nGhostwriter GraphQL operation '{operation_name}' failed with variables "
-                        f"{variables}: {e}"
-                    )
-                    await asyncio.sleep(self.wait_timeout)
-                    continue
-                except GraphQLError as e:
-                    mythic_sync_log.exception(
-                        "Ghostwriter GraphQL operation '%s' failed with variables %s: %s",
-                        operation_name,
-                        variables,
-                        e,
-                    )
-                    await self._post_error_notification(
-                        f"MythicSync:\nGhostwriter GraphQL operation '{operation_name}' failed with variables "
-                        f"{variables}: {e}"
-                    )
-                    await asyncio.sleep(self.wait_timeout)
-                    continue
-            except Exception as exc:
+                result = await self.session.execute(query, variable_values=variable_values)
+                mythic_sync_log.debug("Successfully executed query with result: %s", result)
+                return result
+            except (TimeoutError, builtins.TimeoutError):
                 mythic_sync_log.error(
-                    "Exception occurred while trying to post the query to Ghostwriter! Trying again in %s seconds...",
-                    self.wait_timeout
+                    "Ghostwriter GraphQL operation '%s' timed out at %s with variables %s",
+                    operation_name,
+                    self.GHOSTWRITER_URL,
+                    variables,
                 )
                 await self._post_error_notification(
-                    f"MythicSync:\nException occurred while trying to post the query to Ghostwriter!\n{exc}")
-                await asyncio.sleep(self.wait_timeout)
-                continue
+                    f"MythicSync:\nGhostwriter GraphQL operation '{operation_name}' timed out at "
+                    f"{self.GHOSTWRITER_URL} with variables {variables}",
+                    source=f"mythic_sync_query_{operation_name}",
+                )
+                if not retry:
+                    raise
+            except TransportQueryError as exc:
+                mythic_sync_log.error(
+                    "Ghostwriter GraphQL operation '%s' failed with variables %s: %s",
+                    operation_name,
+                    variables,
+                    exc,
+                )
+                payload = next(
+                    (error for error in (exc.errors or []) if isinstance(error, dict)),
+                    {},
+                )
+                code = payload.get("extensions", {}).get("code")
+                if code == "access-denied":
+                    message = (
+                        f"Access denied for Ghostwriter GraphQL operation '{operation_name}' with variables "
+                        f"{variables}. Check that the provided service token is valid and has the required "
+                        "permissions."
+                    )
+                    source = "mythic_sync_access_denied"
+                    retry_delay = max(retry_delay, 60)
+                elif code == "postgres-error":
+                    message = (
+                        f"Ghostwriter's database rejected GraphQL operation '{operation_name}' with variables "
+                        f"{variables}. Check if your configured log ID ({self.GHOSTWRITER_OPLOG_ID}) is correct."
+                    )
+                    source = "mythic_sync_reject"
+                elif code == "ModelDoesNotExist":
+                    message = (
+                        "Ghostwriter could not find or authorize the model requested by GraphQL operation "
+                        f"'{operation_name}' with variables {variables}. The referenced oplog entry may not "
+                        "exist, or the service token may not have permission to access it."
+                    )
+                    source = "mythic_sync_model_not_found"
+                    retry_delay = max(retry_delay, 60)
+                else:
+                    message = (
+                        f"MythicSync:\nGhostwriter GraphQL operation '{operation_name}' failed with variables "
+                        f"{variables}: {exc}"
+                    )
+                    source = f"mythic_sync_query_{operation_name}"
+                await self._post_error_notification(message=message, source=source)
+                if not retry:
+                    raise
+            except GraphQLError as exc:
+                mythic_sync_log.exception(
+                    "Ghostwriter GraphQL operation '%s' failed with variables %s: %s",
+                    operation_name,
+                    variables,
+                    exc,
+                )
+                await self._post_error_notification(
+                    message=f"MythicSync:\nGhostwriter GraphQL operation '{operation_name}' failed with "
+                            f"variables {variables}: {exc}",
+                    source=f"mythic_sync_query_{operation_name}",
+                )
+                if not retry:
+                    raise
+            except Exception as exc:
+                mythic_sync_log.exception(
+                    "Unexpected failure in Ghostwriter GraphQL operation '%s' with variables %s",
+                    operation_name,
+                    variables,
+                )
+                await self._post_error_notification(
+                    message=f"MythicSync:\nUnexpected failure in Ghostwriter GraphQL operation "
+                            f"'{operation_name}' with variables {variables}: {exc}",
+                    source=f"mythic_sync_query_{operation_name}",
+                )
+                if not retry:
+                    raise
+
+            retry_delay = await self._wait_for_query_retry(operation_name, retry_delay)
 
     async def _check_token(self) -> None:
         """Send a `whoami` query to Ghostwriter to check authentication and token expiration."""
@@ -421,11 +453,30 @@ class MythicSync:
             message = "Mythic Sync logged an error and may need attention to continue syncing.\n" \
                       "Run this command to review the issue:\n\n" \
                       "  sudo ./mythic-cli logs mythic_sync"
+        notification_source = "mythic_sync" if source is None else source
+        now = datetime.now(timezone.utc)
+        last_notification = self._notification_timestamps.get(notification_source)
+        if last_notification is not None and now - last_notification < self.last_error_delta:
+            mythic_sync_log.debug(
+                "Suppressing duplicate Mythic notification from '%s': %s",
+                notification_source,
+                message,
+            )
+            return
+
         mythic_sync_log.info("Submitting an error notification to Mythic's notification center: %s", message)
-        await mythic.send_event_log_message(mythic=self.mythic_instance,
-                                            message=message,
-                                            source="mythic_sync" if source is None else source,
-                                            level="warning")
+        try:
+            await mythic.send_event_log_message(mythic=self.mythic_instance,
+                                                message=message,
+                                                source=notification_source,
+                                                level="warning")
+        except Exception:
+            mythic_sync_log.exception(
+                "Failed to submit Mythic notification from '%s'",
+                notification_source,
+            )
+            return
+        self._notification_timestamps[notification_source] = now
         return
 
     async def _mythic_task_to_ghostwriter_message(self, message: dict) -> dict:
@@ -504,29 +555,122 @@ class MythicSync:
             )
         return gw_message
 
-    async def _handleTaskTags(self, tags: list, entry_id: str) -> None:
-        """
-        Process a Mythic Task's tags for an oplog entry
-        :param message:
-        :return:
-        """
-        # given an oplog_entry id, fetch its current tags, merge it with message['tags']
-        currentTags = await self._execute_query(self.query_oplog_entry_tags, {
-            "oplog_entry_id": entry_id,
-        })
-        updatedTags = []
-        for currentTag in currentTags['tags']['tags']:
-            if currentTag.startswith("mythic:"):
-                if currentTag in tags:
-                    updatedTags.append(currentTag)
+    def _queue_task_tags(self, tags: list, entry_id: str) -> None:
+        """Persist the latest desired Mythic tags for asynchronous processing."""
+        entry_id = str(entry_id)
+        payload = json.dumps(
+            {"attempt": 0, "entry_id": entry_id, "tags": tags},
+            sort_keys=True,
+        )
+        pipeline = self.rconn.pipeline(transaction=True)
+        pipeline.hset(self.tag_retry_data_key, entry_id, payload)
+        pipeline.zadd(self.tag_retry_schedule_key, {entry_id: time.time()})
+        pipeline.execute()
+
+    async def _handle_task_tags(self, tags: list, entry_id: str, retry: bool = False) -> None:
+        """Merge Mythic tags into one Ghostwriter oplog entry."""
+        current_tags = await self._execute_query(
+            self.query_oplog_entry_tags,
+            {"oplog_entry_id": entry_id},
+            retry=retry,
+        )
+        updated_tags = []
+        for current_tag in current_tags['tags']['tags']:
+            if current_tag.startswith("mythic:"):
+                if current_tag in tags:
+                    updated_tags.append(current_tag)
             else:
-                updatedTags.append(currentTag)
-        for currentTag in tags:
-            updatedTags.append(currentTag)
-        await self._execute_query(self.set_tags_mutation, {
-            "oplog_entry_id": entry_id,
-            "tags": updatedTags
-        })
+                updated_tags.append(current_tag)
+        for current_tag in tags:
+            if current_tag not in updated_tags:
+                updated_tags.append(current_tag)
+        await self._execute_query(
+            self.set_tags_mutation,
+            {"oplog_entry_id": entry_id, "tags": updated_tags},
+            retry=retry,
+        )
+
+    async def _process_pending_tag_update(self, entry_id: str) -> None:
+        """Attempt one queued tag update and reschedule it on any failure."""
+        payload_raw = self.rconn.hget(self.tag_retry_data_key, entry_id)
+        if payload_raw is None:
+            self.rconn.zrem(self.tag_retry_schedule_key, entry_id)
+            return
+
+        payload = json.loads(payload_raw)
+        try:
+            await self._handle_task_tags(payload["tags"], payload["entry_id"], retry=False)
+        except Exception:
+            current_payload = self.rconn.hget(self.tag_retry_data_key, entry_id)
+            if current_payload == payload_raw:
+                attempt = payload.get("attempt", 0) + 1
+                retry_delay = min(
+                    self.max_retry_timeout,
+                    self.wait_timeout * (2 ** min(attempt, 10)),
+                )
+                retry_delay = min(
+                    self.max_retry_timeout,
+                    random.uniform(retry_delay * 0.8, retry_delay * 1.2),
+                )
+                payload["attempt"] = attempt
+                pipeline = self.rconn.pipeline(transaction=True)
+                pipeline.hset(
+                    self.tag_retry_data_key,
+                    entry_id,
+                    json.dumps(payload, sort_keys=True),
+                )
+                pipeline.zadd(
+                    self.tag_retry_schedule_key,
+                    {entry_id: time.time() + retry_delay},
+                )
+                pipeline.execute()
+                mythic_sync_log.warning(
+                    "Tag update for Ghostwriter oplog entry %s failed; retrying in %.1f seconds",
+                    entry_id,
+                    retry_delay,
+                )
+            return
+
+        current_payload = self.rconn.hget(self.tag_retry_data_key, entry_id)
+        if current_payload == payload_raw:
+            pipeline = self.rconn.pipeline(transaction=True)
+            pipeline.hdel(self.tag_retry_data_key, entry_id)
+            pipeline.zrem(self.tag_retry_schedule_key, entry_id)
+            pipeline.execute()
+
+    async def retry_pending_tags(self) -> None:
+        """Continuously process due tag updates without blocking log ingestion."""
+        mythic_sync_log.info("Starting pending Ghostwriter tag update worker")
+        while True:
+            try:
+                due_entries = self.rconn.zrangebyscore(
+                    self.tag_retry_schedule_key,
+                    0,
+                    time.time(),
+                    start=0,
+                    num=1,
+                )
+                if due_entries:
+                    entry_id = due_entries[0]
+                    if isinstance(entry_id, bytes):
+                        entry_id = entry_id.decode()
+                    await self._process_pending_tag_update(str(entry_id))
+                    continue
+            except Exception:
+                mythic_sync_log.exception("Failed while processing pending Ghostwriter tag updates")
+                await self._post_error_notification(source="mythic_sync_tag_retry_worker")
+            await asyncio.sleep(self.tag_retry_poll_interval)
+
+    @staticmethod
+    def _get_returning_entry_id(result: dict, mutation_name: str) -> str:
+        """Return the first entry ID from a Ghostwriter mutation response, if present."""
+        if not result or mutation_name not in result:
+            return ""
+        returning = result[mutation_name].get("returning", [])
+        if not returning:
+            return ""
+        return str(returning[0]["id"])
+
     async def _create_entry(self, message: dict) -> None:
         """
         Create an entry for a Mythic task in Ghostwriter's ``OplogEntry`` model. Uses the
@@ -561,20 +705,22 @@ class MythicSync:
                     "entry_identifier": gw_message['entry_identifier'],
                 })
                 if query_result and "oplogEntry" in query_result and len(query_result["oplogEntry"]) > 0:
+                    ghostwriter_entry_id = str(query_result["oplogEntry"][0]["id"])
                     mythic_sync_log.info(
                         f"Duplicate entry found based on entryIdentifier, {gw_message['entry_identifier']}, not sending")
                     # save off id of oplog entry with this gw_message['entry_identifier'] so we don't try to send it again
-                    self.rconn.set(entry_id, query_result["oplogEntry"][0]["id"])
-                    await self._handleTaskTags(tags, query_result["oplogEntry"][0]["id"])
+                    self.rconn.set(entry_id, ghostwriter_entry_id)
+                    self._queue_task_tags(tags, ghostwriter_entry_id)
                     return
                 result = await self._execute_query(self.insert_query, gw_message)
-                if result and "insert_oplogEntry" in result:
+                ghostwriter_entry_id = self._get_returning_entry_id(result, "insert_oplogEntry")
+                if ghostwriter_entry_id:
                     # JSON response example: `{'data': {'insert_oplogEntry': {'returning': [{'id': 192}]}}}`
-                    self.rconn.set(entry_id, result["insert_oplogEntry"]["returning"][0]["id"])
-                    await self._handleTaskTags(tags, result["insert_oplogEntry"]["returning"][0]["id"])
+                    self.rconn.set(entry_id, ghostwriter_entry_id)
+                    self._queue_task_tags(tags, ghostwriter_entry_id)
                 else:
-                    mythic_sync_log.info(
-                        "Did not receive a response with data from Ghostwriter's GraphQL API! Response: %s",
+                    raise RuntimeError(
+                        "Ghostwriter did not return an inserted oplog entry ID. Response: %s" %
                         result
                     )
             except Exception:
@@ -602,15 +748,56 @@ class MythicSync:
         tags = gw_message.pop("tags", [])
         try:
             result = await self._execute_query(self.update_query, gw_message)
-            if not result or "update_oplogEntry" not in result:
-                mythic_sync_log.info(
-                    "Did not receive a response with data from Ghostwriter's GraphQL API! Response: %s",
-                    result
+            ghostwriter_entry_id = self._get_returning_entry_id(result, "update_oplogEntry")
+            if not ghostwriter_entry_id:
+                mythic_entry_id = message["agent_task_id"]
+                stale_entry_id = gw_message.pop("id")
+                mythic_sync_log.warning(
+                    "Ghostwriter oplog entry %s cached for Mythic task %s no longer exists or is inaccessible; "
+                    "reconciling with entryIdentifier %s",
+                    stale_entry_id,
+                    mythic_entry_id,
+                    gw_message["entry_identifier"],
                 )
-            else:
-                await self._handleTaskTags(tags, entry_id)
+                self.rconn.delete(mythic_entry_id)
+
+                query_result = await self._execute_query(
+                    self.entry_identifier_query,
+                    {
+                        "oplog": gw_message["oplog"],
+                        "entry_identifier": gw_message["entry_identifier"],
+                    },
+                )
+                existing_entries = query_result.get("oplogEntry", []) if query_result else []
+                if existing_entries:
+                    ghostwriter_entry_id = str(existing_entries[0]["id"])
+                    gw_message["id"] = ghostwriter_entry_id
+                    retry_result = await self._execute_query(self.update_query, gw_message)
+                    updated_entry_id = self._get_returning_entry_id(retry_result, "update_oplogEntry")
+                    if not updated_entry_id:
+                        raise RuntimeError(
+                            "Ghostwriter found oplog entry %s by entryIdentifier but did not update it. "
+                            "Response: %s" % (ghostwriter_entry_id, retry_result)
+                        )
+                    ghostwriter_entry_id = updated_entry_id
+                else:
+                    insert_result = await self._execute_query(self.insert_query, gw_message)
+                    ghostwriter_entry_id = self._get_returning_entry_id(
+                        insert_result,
+                        "insert_oplogEntry",
+                    )
+                    if not ghostwriter_entry_id:
+                        raise RuntimeError(
+                            "Ghostwriter did not return an ID while recreating stale oplog entry %s. "
+                            "Response: %s" % (stale_entry_id, insert_result)
+                        )
+
+                self.rconn.set(mythic_entry_id, ghostwriter_entry_id)
+
+            self._queue_task_tags(tags, ghostwriter_entry_id)
         except Exception:
             mythic_sync_log.exception("Exception encountered while trying to update task log entry in Ghostwriter!")
+            await self._post_error_notification(source="mythic_sync_update_entry")
 
     async def handle_task(self) -> None:
         """
@@ -806,6 +993,7 @@ async def scripting():
             _ = await asyncio.gather(
                 mythic_sync.handle_task(),
                 mythic_sync.handle_callback(),
+                mythic_sync.retry_pending_tags(),
             )
         except Exception:
             mythic_sync_log.exception(
@@ -814,5 +1002,5 @@ async def scripting():
         finally:
             await mythic_sync.client.close_async()
 
-
-asyncio.run(scripting())
+if __name__ == "__main__":
+    asyncio.run(scripting())

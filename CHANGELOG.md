@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 18 July 2026
+
+### Added
+
+* Added a Redis-backed retry queue for Ghostwriter oplog tag updates so tag failures do not block log entry ingestion.
+* Added tests for query retries, stale entry reconciliation, deleted entry recreation, tag retries, and source IP formatting.
+
+### Changed
+
+* Changed Ghostwriter GraphQL retries to use exponential backoff with jitter, capped at five minutes.
+* Improved GraphQL error messages with the operation name and variables, including actionable context for ambiguous `ModelDoesNotExist` responses.
+* Changed source IP formatting from a JSON array to a sorted, comma-separated string.
+
+### Fixed
+
+* Fixed stale Redis entry mappings by looking up the Ghostwriter entry by `entryIdentifier` and repairing the mapping or recreating a deleted entry.
+* Prevented repeated Mythic error notifications and notification delivery failures from interfering with GraphQL retries.
+
 ## [3.0.8] - 25 July 2025
 
 ### Changed
