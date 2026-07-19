@@ -34,5 +34,28 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          load: true
           push: false
           tags: mythic-sync:test
+      - name: Verify Redis AOF persistence across container recreation
+        run: |
+          docker volume create mythic_sync_test_redis
+          docker run --detach --name mythic-sync-redis-before \
+            --volume mythic_sync_test_redis:/data \
+            --entrypoint redis-server mythic-sync:test \
+            --appendonly yes --appendfsync always --dir /data
+          until docker exec mythic-sync-redis-before redis-cli ping; do sleep 1; done
+          docker exec mythic-sync-redis-before redis-cli set mythic_sync:persistence_test queued
+          docker stop mythic-sync-redis-before
+          docker rm mythic-sync-redis-before
+          docker run --detach --name mythic-sync-redis-after \
+            --volume mythic_sync_test_redis:/data \
+            --entrypoint redis-server mythic-sync:test \
+            --appendonly yes --appendfsync always --dir /data
+          until docker exec mythic-sync-redis-after redis-cli ping; do sleep 1; done
+          test "$(docker exec mythic-sync-redis-after redis-cli get mythic_sync:persistence_test)" = queued
+      - name: Clean up Redis persistence test
+        if: always()
+        run: |
+          docker rm --force mythic-sync-redis-before mythic-sync-redis-after 2>/dev/null || true
+          docker volume rm mythic_sync_test_redis 2>/dev/null || true

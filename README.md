@@ -76,10 +76,21 @@ Set `MYTHIC_API_KEY` to authenticate with a Mythic API key instead of `MYTHIC_US
 `MYTHIC_PASSWORD`.
 
 The standalone Compose deployment stores entry mappings and pending tag updates in the named
-`mythic_sync_redis` volume. Redis append-only persistence is enabled so recreating the
+`mythic_sync_redis` volume. Redis append-only persistence with `appendfsync always` is enabled so recreating the
 `mythic_sync` application container does not discard pending work. Mythic installations default
-to an embedded append-only Redis instance for compatibility; `REDIS_HOSTNAME`, `REDIS_PORT`, and
-`REDIS_DB` can select an external persistent Redis instance.
+to an embedded append-only Redis instance for compatibility. To preserve that data across service
+recreation, configure Mythic's generated Compose service to mount a stable named volume at `/data`;
+the Dockerfile's volume declaration alone does not guarantee that a replacement container will
+reattach the same storage. Alternatively, `REDIS_HOSTNAME`, `REDIS_PORT`, and `REDIS_DB` can select
+an external persistent Redis instance.
+
+For an authenticated or TLS-protected external Redis service, set `REDIS_URL` instead of the three
+individual Redis settings. The URL takes precedence and may include the database number, username,
+and password. Its credentials are never written to the service log:
+
+```text
+REDIS_URL=rediss://sync-user:password@redis.example.com:6380/1
+```
 
 Once the environment variables are set up, you can launch the service by using `docker-compose`:
 
@@ -104,10 +115,58 @@ Ensure the host where `mythic_sync` is running has network access to the Ghostwr
 `mythic_sync` uses Redis to track events already sent to Ghostwriter and to retain pending tag
 updates. Redis mappings are scoped by Mythic server and Ghostwriter oplog. Legacy mappings and
 pending tag jobs are migrated automatically when first accessed after an upgrade.
+If a queued tag job's entry no longer resolves by `entryIdentifier`, the worker removes it from
+active retries but preserves its payload in the deployment's namespaced Redis dead-letter hash and
+notifies Mythic. A later task update can create a fresh tag job for the current entry.
+
+The dead-letter hash is named:
+
+```text
+mythic_sync:<oplog-id>:<mythic-host>:pending_tag_updates:dead_letter
+```
+
+The startup warning prints the exact key. For the standalone Compose deployment, inspect it with:
+
+```bash
+docker compose exec redis redis-cli -n 1 HGETALL \
+  "mythic_sync:<oplog-id>:<mythic-host>:pending_tag_updates:dead_letter"
+```
+
+After investigating an individual job, remove only that field with `HDEL <hash-key> <entry-id>`.
+There is intentionally no automatic dead-letter replay in this release; updating the corresponding
+Mythic task creates a fresh tag job if Ghostwriter can resolve or recreate its oplog entry.
+
+The embedded Redis process flushes and shuts down when the application container receives
+`SIGTERM`. Both embedded and standalone configurations use synchronous AOF writes. Do not remove
+or renew the Redis data volume during upgrades if queued work must survive.
 
 At startup, the service logs the selected Redis endpoint and number of pending tag updates. A
 successful Redis client construction is not sufficient: the service waits for `PING` to succeed
 before subscribing to Mythic events.
+
+Run only one `mythic_sync` instance for a given Mythic server and Ghostwriter oplog namespace.
+This release does not coordinate tag workers across multiple active replicas.
+
+### Manual Acceptance Checklist
+
+Perform destructive checks only in a disposable test oplog.
+
+1. Start `mythic_sync` and confirm the initialization entry appears once in Ghostwriter. Restart
+   the service and confirm a duplicate initialization entry is not created.
+2. Run a Mythic task and confirm Ghostwriter receives an oplog entry whose `entryIdentifier`
+   matches the Mythic `agent_task_id`. Update the task and confirm the existing entry changes rather
+   than creating a duplicate.
+3. Delete that Ghostwriter entry, then update the Mythic task. Confirm the logs identify the stale
+   Ghostwriter ID and `entryIdentifier`, and that the entry is found again or recreated.
+4. Add, change, and remove tags on the Mythic task. Confirm Ghostwriter's corresponding `mythic:`
+   tags converge to the current Mythic tags while any Ghostwriter tags without the `mythic:` prefix
+   remain unchanged. Stale-target and dead-letter behavior is covered by the automated test suite.
+5. With a stable Redis volume attached, note the startup pending/dead-letter counts, restart or
+   recreate only the `mythic_sync` container, and confirm the counts and Redis data remain. Do not
+   remove or renew the volume during this check.
+6. Temporarily use a service token without the required test-oplog permission and confirm the error
+   identifies the GraphQL operation, oplog or entry identifier, and likely permission problem without
+   logging command or comment contents.
 
 ### Testing
 
@@ -121,7 +180,8 @@ docker run --rm --entrypoint /opt/venv/bin/python \
   mythic-sync-test -m unittest -v
 ```
 
-The suite covers retries, stale and deleted entries, Redis migrations, tag queue processing,
+The suite covers retries, `ModelDoesNotExist` reconciliation, stale and deleted entries, Redis
+migrations, tag queue processing,
 authentication selection, timestamp and IP normalization, initialization idempotency, and
 diagnostic redaction.
 

@@ -215,6 +215,7 @@ class MythicSync:
     MYTHIC_URL = f"https://{MYTHIC_IP}:{MYTHIC_PORT}"
 
     # Redis server
+    REDIS_URL = os.environ.get("REDIS_URL") or ""
     REDIS_HOSTNAME = os.environ.get("REDIS_HOSTNAME", "127.0.0.1")
     REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
     REDIS_DB = int(os.environ.get("REDIS_DB", "1"))
@@ -253,6 +254,7 @@ class MythicSync:
         self.redis_namespace = f"mythic_sync:{self.GHOSTWRITER_OPLOG_ID}:{self.MYTHIC_IP}"
         self.tag_retry_data_key = f"{self.redis_namespace}:pending_tag_updates:data"
         self.tag_retry_schedule_key = f"{self.redis_namespace}:pending_tag_updates:schedule"
+        self.tag_retry_dead_letter_key = f"{self.redis_namespace}:pending_tag_updates:dead_letter"
 
     async def initialize(self) -> None:
         """
@@ -379,6 +381,16 @@ class MythicSync:
         variables = json.dumps(diagnostic_variables, default=str, sort_keys=True)
         return operation_name, variables
 
+    @staticmethod
+    def _get_transport_error_code(exc: TransportQueryError) -> str | None:
+        """Return the first GraphQL extension code attached to a transport error."""
+        for error in exc.errors or []:
+            if isinstance(error, dict):
+                code = error.get("extensions", {}).get("code")
+                if code:
+                    return code
+        return None
+
     async def _wait_for_query_retry(self, operation_name: str, retry_delay: float) -> float:
         """Sleep with jitter before a retry and return the next capped base delay."""
         sleep_for = min(
@@ -398,6 +410,7 @@ class MythicSync:
             query: DocumentNode,
             variable_values: dict = None,
             retry: bool = True,
+            retry_model_not_found: bool = True,
     ) -> dict:
         """
         Execute a GraphQL query against the Ghostwriter server.
@@ -437,11 +450,7 @@ class MythicSync:
                     variables,
                     exc,
                 )
-                payload = next(
-                    (error for error in (exc.errors or []) if isinstance(error, dict)),
-                    {},
-                )
-                code = payload.get("extensions", {}).get("code")
+                code = self._get_transport_error_code(exc)
                 if code == "access-denied":
                     message = (
                         f"Access denied for Ghostwriter GraphQL operation '{operation_name}' with variables "
@@ -471,7 +480,7 @@ class MythicSync:
                     )
                     source = f"mythic_sync_query_{operation_name}"
                 await self._post_error_notification(message=message, source=source)
-                if not retry:
+                if not retry or (code == "ModelDoesNotExist" and not retry_model_not_found):
                     raise
             except GraphQLError as exc:
                 mythic_sync_log.exception(
@@ -566,6 +575,11 @@ class MythicSync:
 
     async def _post_error_notification(self, message: str = None, source: str = None) -> None:
         """Send an error notification to Mythic's notification center."""
+        if self.mythic_instance is None:
+            mythic_sync_log.debug(
+                "Skipping Mythic error notification because Mythic authentication is not established"
+            )
+            return
         if message is None:
             message = "Mythic Sync logged an error and may need attention to continue syncing.\n" \
                       "Run this command to review the issue:\n\n" \
@@ -661,11 +675,16 @@ class MythicSync:
             "command": "",
         }
 
-    def _queue_task_tags(self, tags: list, entry_id: str) -> None:
+    def _queue_task_tags(self, tags: list, entry_id: str, entry_identifier: str) -> None:
         """Persist the latest desired Mythic tags for asynchronous processing."""
         entry_id = str(entry_id)
         payload = json.dumps(
-            {"attempt": 0, "entry_id": entry_id, "tags": tags},
+            {
+                "attempt": 0,
+                "entry_id": entry_id,
+                "entry_identifier": entry_identifier,
+                "tags": tags,
+            },
             sort_keys=True,
         )
         pipeline = self.rconn.pipeline(transaction=True)
@@ -696,6 +715,154 @@ class MythicSync:
             retry=retry,
         )
 
+    def _remove_pending_tag_update(self, entry_id: str, expected_payload: bytes | str) -> bool:
+        """Remove a pending job only when it has not been replaced by newer tag data."""
+        if self.rconn.hget(self.tag_retry_data_key, entry_id) != expected_payload:
+            return False
+        pipeline = self.rconn.pipeline(transaction=True)
+        pipeline.hdel(self.tag_retry_data_key, entry_id)
+        pipeline.zrem(self.tag_retry_schedule_key, entry_id)
+        pipeline.execute()
+        return True
+
+    def _dead_letter_pending_tag_update(
+            self,
+            entry_id: str,
+            payload: dict,
+            expected_payload: bytes | str,
+            reason: str,
+    ) -> bool:
+        """Retain an irrecoverable tag job for diagnosis while removing it from active retries."""
+        if self.rconn.hget(self.tag_retry_data_key, entry_id) != expected_payload:
+            return False
+        dead_letter = dict(payload)
+        dead_letter["dead_lettered_at"] = datetime.now(timezone.utc).isoformat()
+        dead_letter["reason"] = reason
+        pipeline = self.rconn.pipeline(transaction=True)
+        pipeline.hdel(self.tag_retry_data_key, entry_id)
+        pipeline.zrem(self.tag_retry_schedule_key, entry_id)
+        pipeline.hset(
+            self.tag_retry_dead_letter_key,
+            entry_id,
+            json.dumps(dead_letter, sort_keys=True),
+        )
+        pipeline.execute()
+        return True
+
+    def _reschedule_pending_tag_update(
+            self,
+            entry_id: str,
+            payload: dict,
+            expected_payload: bytes | str,
+    ) -> None:
+        """Apply capped exponential backoff to a pending tag job."""
+        if self.rconn.hget(self.tag_retry_data_key, entry_id) != expected_payload:
+            return
+        attempt = payload.get("attempt", 0) + 1
+        retry_delay = min(
+            self.max_retry_timeout,
+            self.wait_timeout * (2 ** min(attempt, 10)),
+        )
+        retry_delay = min(
+            self.max_retry_timeout,
+            random.uniform(retry_delay * 0.8, retry_delay * 1.2),
+        )
+        payload["attempt"] = attempt
+        pipeline = self.rconn.pipeline(transaction=True)
+        pipeline.hset(
+            self.tag_retry_data_key,
+            entry_id,
+            json.dumps(payload, sort_keys=True),
+        )
+        pipeline.zadd(
+            self.tag_retry_schedule_key,
+            {entry_id: time.time() + retry_delay},
+        )
+        pipeline.execute()
+        mythic_sync_log.warning(
+            "Tag update for Ghostwriter oplog entry %s failed; retrying in %.1f seconds",
+            entry_id,
+            retry_delay,
+        )
+
+    async def _reconcile_pending_tag_update(
+            self,
+            stale_entry_id: str,
+            payload: dict,
+            expected_payload: bytes | str,
+    ) -> None:
+        """Move a stale tag job to the current entry or retire it when the entry was deleted."""
+        entry_identifier = payload.get("entry_identifier")
+        if not entry_identifier:
+            if self._dead_letter_pending_tag_update(
+                    stale_entry_id,
+                    payload,
+                    expected_payload,
+                    "legacy job has no entry identifier",
+            ):
+                mythic_sync_log.error(
+                    "Dead-lettered legacy tag job for missing Ghostwriter entry %s because it has no entry identifier",
+                    stale_entry_id,
+                )
+                await self._post_error_notification(source="mythic_sync_orphaned_tag_update")
+            return
+
+        query_result = await self._execute_query(
+            self.entry_identifier_query,
+            {
+                "oplog": self.GHOSTWRITER_OPLOG_ID,
+                "entry_identifier": entry_identifier,
+            },
+            retry=False,
+            retry_model_not_found=False,
+        )
+        existing_entries = query_result.get("oplogEntry", []) if query_result else []
+        if not existing_entries:
+            if self._dead_letter_pending_tag_update(
+                    stale_entry_id,
+                    payload,
+                    expected_payload,
+                    "entry identifier no longer resolves in Ghostwriter",
+            ):
+                mythic_sync_log.error(
+                    "Dead-lettered tag job for deleted or inaccessible Ghostwriter entry %s (entryIdentifier %s)",
+                    stale_entry_id,
+                    entry_identifier,
+                )
+                await self._post_error_notification(
+                    message=(
+                        "Mythic Sync stopped retrying a tag update for Ghostwriter entry "
+                        f"{stale_entry_id} (entryIdentifier {entry_identifier}) because the entry no longer "
+                        "resolves. The job remains in the Redis dead-letter hash for diagnosis."
+                    ),
+                    source="mythic_sync_orphaned_tag_update",
+                )
+            return
+
+        current_entry_id = str(existing_entries[0]["id"])
+        if current_entry_id == stale_entry_id:
+            raise RuntimeError(
+                "Ghostwriter resolved entryIdentifier %s to entry %s, but its tag API reported that entry missing"
+                % (entry_identifier, stale_entry_id)
+            )
+        if self.rconn.hget(self.tag_retry_data_key, stale_entry_id) != expected_payload:
+            return
+
+        payload["attempt"] = 0
+        payload["entry_id"] = current_entry_id
+        pipeline = self.rconn.pipeline(transaction=True)
+        pipeline.hdel(self.tag_retry_data_key, stale_entry_id)
+        pipeline.zrem(self.tag_retry_schedule_key, stale_entry_id)
+        pipeline.hset(self.tag_retry_data_key, current_entry_id, json.dumps(payload, sort_keys=True))
+        pipeline.zadd(self.tag_retry_schedule_key, {current_entry_id: time.time()})
+        pipeline.execute()
+        self._set_cached_entry_id(entry_identifier, current_entry_id)
+        mythic_sync_log.info(
+            "Moved pending tag update from stale Ghostwriter entry %s to entry %s",
+            stale_entry_id,
+            current_entry_id,
+        )
+
     async def _process_pending_tag_update(self, entry_id: str) -> None:
         """Attempt one queued tag update and reschedule it on any failure."""
         payload_raw = self.rconn.hget(self.tag_retry_data_key, entry_id)
@@ -706,43 +873,23 @@ class MythicSync:
         payload = json.loads(payload_raw)
         try:
             await self._handle_task_tags(payload["tags"], payload["entry_id"], retry=False)
+        except TransportQueryError as exc:
+            if self._get_transport_error_code(exc) == "ModelDoesNotExist":
+                try:
+                    await self._reconcile_pending_tag_update(entry_id, payload, payload_raw)
+                    return
+                except Exception:
+                    mythic_sync_log.exception(
+                        "Failed to reconcile missing Ghostwriter entry %s for a pending tag update",
+                        entry_id,
+                    )
+            self._reschedule_pending_tag_update(entry_id, payload, payload_raw)
+            return
         except Exception:
-            current_payload = self.rconn.hget(self.tag_retry_data_key, entry_id)
-            if current_payload == payload_raw:
-                attempt = payload.get("attempt", 0) + 1
-                retry_delay = min(
-                    self.max_retry_timeout,
-                    self.wait_timeout * (2 ** min(attempt, 10)),
-                )
-                retry_delay = min(
-                    self.max_retry_timeout,
-                    random.uniform(retry_delay * 0.8, retry_delay * 1.2),
-                )
-                payload["attempt"] = attempt
-                pipeline = self.rconn.pipeline(transaction=True)
-                pipeline.hset(
-                    self.tag_retry_data_key,
-                    entry_id,
-                    json.dumps(payload, sort_keys=True),
-                )
-                pipeline.zadd(
-                    self.tag_retry_schedule_key,
-                    {entry_id: time.time() + retry_delay},
-                )
-                pipeline.execute()
-                mythic_sync_log.warning(
-                    "Tag update for Ghostwriter oplog entry %s failed; retrying in %.1f seconds",
-                    entry_id,
-                    retry_delay,
-                )
+            self._reschedule_pending_tag_update(entry_id, payload, payload_raw)
             return
 
-        current_payload = self.rconn.hget(self.tag_retry_data_key, entry_id)
-        if current_payload == payload_raw:
-            pipeline = self.rconn.pipeline(transaction=True)
-            pipeline.hdel(self.tag_retry_data_key, entry_id)
-            pipeline.zrem(self.tag_retry_schedule_key, entry_id)
-            pipeline.execute()
+        self._remove_pending_tag_update(entry_id, payload_raw)
 
     async def retry_pending_tags(self) -> None:
         """Continuously process due tag updates without blocking log ingestion."""
@@ -821,14 +968,14 @@ class MythicSync:
                         f"Duplicate entry found based on entryIdentifier, {gw_message['entry_identifier']}, not sending")
                     # save off id of oplog entry with this gw_message['entry_identifier'] so we don't try to send it again
                     self._set_cached_entry_id(entry_id, ghostwriter_entry_id)
-                    self._queue_task_tags(tags, ghostwriter_entry_id)
+                    self._queue_task_tags(tags, ghostwriter_entry_id, gw_message["entry_identifier"])
                     return
                 result = await self._execute_query(self.insert_query, gw_message)
                 ghostwriter_entry_id = self._get_returning_entry_id(result, "insert_oplogEntry")
                 if ghostwriter_entry_id:
                     # JSON response example: `{'data': {'insert_oplogEntry': {'returning': [{'id': 192}]}}}`
                     self._set_cached_entry_id(entry_id, ghostwriter_entry_id)
-                    self._queue_task_tags(tags, ghostwriter_entry_id)
+                    self._queue_task_tags(tags, ghostwriter_entry_id, gw_message["entry_identifier"])
                 else:
                     raise RuntimeError(
                         "Ghostwriter did not return an inserted oplog entry ID. Response: %s" %
@@ -867,7 +1014,16 @@ class MythicSync:
         gw_message["id"] = entry_id
         tags = gw_message.pop("tags", [])
         try:
-            result = await self._execute_query(self.update_query, gw_message)
+            try:
+                result = await self._execute_query(
+                    self.update_query,
+                    gw_message,
+                    retry_model_not_found=False,
+                )
+            except TransportQueryError as exc:
+                if self._get_transport_error_code(exc) != "ModelDoesNotExist":
+                    raise
+                result = {}
             ghostwriter_entry_id = self._get_returning_entry_id(result, "update_oplogEntry")
             if not ghostwriter_entry_id:
                 mythic_entry_id = message["agent_task_id"]
@@ -914,7 +1070,7 @@ class MythicSync:
 
                 self._set_cached_entry_id(mythic_entry_id, ghostwriter_entry_id)
 
-            self._queue_task_tags(tags, ghostwriter_entry_id)
+            self._queue_task_tags(tags, ghostwriter_entry_id, gw_message["entry_identifier"])
         except Exception:
             mythic_sync_log.exception("Exception encountered while trying to update task log entry in Ghostwriter!")
             await self._post_error_notification(source="mythic_sync_update_entry")
@@ -1036,31 +1192,49 @@ class MythicSync:
         """Wait for Redis to accept commands and report the selected durable state."""
         while True:
             try:
-                self.rconn = redis.Redis(
-                    host=self.REDIS_HOSTNAME,
-                    port=self.REDIS_PORT,
-                    db=self.REDIS_DB,
-                    socket_connect_timeout=5,
-                    socket_timeout=5,
-                )
+                if self.REDIS_URL:
+                    self.rconn = redis.Redis.from_url(
+                        self.REDIS_URL,
+                        socket_connect_timeout=5,
+                        socket_timeout=5,
+                    )
+                    redis_target = "the configured REDIS_URL"
+                else:
+                    self.rconn = redis.Redis(
+                        host=self.REDIS_HOSTNAME,
+                        port=self.REDIS_PORT,
+                        db=self.REDIS_DB,
+                        socket_connect_timeout=5,
+                        socket_timeout=5,
+                    )
+                    redis_target = f"{self.REDIS_HOSTNAME}:{self.REDIS_PORT} database {self.REDIS_DB}"
                 self.rconn.ping()
                 self._migrate_legacy_tag_queue()
                 pending_tags = self.rconn.hlen(self.tag_retry_data_key)
+                dead_letter_tags = self.rconn.hlen(self.tag_retry_dead_letter_key)
                 mythic_sync_log.info(
-                    "Connected to Redis at %s:%s database %s; %s tag update(s) pending",
-                    self.REDIS_HOSTNAME,
-                    self.REDIS_PORT,
-                    self.REDIS_DB,
+                    "Connected to Redis at %s; %s tag update(s) pending, %s dead-lettered",
+                    redis_target,
                     pending_tags,
+                    dead_letter_tags,
                 )
+                if not self.REDIS_URL and self.REDIS_HOSTNAME.lower() in {"127.0.0.1", "localhost"}:
+                    mythic_sync_log.warning(
+                        "Using embedded Redis; mount stable persistent storage at /data before relying on "
+                        "queued jobs to survive Mythic service recreation"
+                    )
+                if dead_letter_tags:
+                    mythic_sync_log.warning(
+                        "%s tag update(s) require operator review in Redis hash '%s'; inspect with HGETALL",
+                        dead_letter_tags,
+                        self.tag_retry_dead_letter_key,
+                    )
                 return
             except Exception:
                 mythic_sync_log.exception(
-                    "Encountered an exception while trying to connect to Redis, %s:%s database %s, trying again "
-                    "in %s seconds...",
-                    self.REDIS_HOSTNAME,
-                    self.REDIS_PORT,
-                    self.REDIS_DB,
+                    "Encountered an exception while trying to connect to Redis at %s, trying again in %s seconds...",
+                    "the configured REDIS_URL" if self.REDIS_URL else
+                    f"{self.REDIS_HOSTNAME}:{self.REDIS_PORT} database {self.REDIS_DB}",
                     self.wait_timeout,
                 )
                 await self._post_error_notification()

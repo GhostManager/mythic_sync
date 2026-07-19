@@ -2,6 +2,8 @@ import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from gql.transport.exceptions import TransportQueryError
+
 
 os.environ.setdefault("MYTHIC_IP", "127.0.0.1")
 os.environ.setdefault("MYTHIC_PORT", "7443")
@@ -10,6 +12,13 @@ os.environ.setdefault("GHOSTWRITER_URL", "http://ghostwriter")
 os.environ.setdefault("GHOSTWRITER_OPLOG_ID", "12")
 
 from sync import MythicSync  # noqa: E402
+
+
+def model_not_found_error():
+    return TransportQueryError(
+        "Not Found",
+        errors=[{"message": "Not Found", "extensions": {"code": "ModelDoesNotExist"}}],
+    )
 
 
 class FakeRedis:
@@ -97,6 +106,7 @@ class FakeRedis:
 class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.sync = MythicSync()
+        self.sync.REDIS_URL = ""
         self.sync.rconn = FakeRedis()
         self.sync._post_error_notification = AsyncMock()
 
@@ -147,6 +157,21 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
         sleep.assert_awaited_once_with(5)
         self.assertEqual(self.sync.session.execute.await_count, 2)
 
+    async def test_model_not_found_can_exit_retry_loop_for_reconciliation(self):
+        self.sync.session = AsyncMock()
+        self.sync.session.execute.side_effect = model_not_found_error()
+
+        with patch("sync.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            with self.assertRaises(TransportQueryError):
+                await self.sync._execute_query(
+                    self.sync.update_query,
+                    {"id": "41", "oplog": "12"},
+                    retry_model_not_found=False,
+                )
+
+        self.assertEqual(self.sync.session.execute.await_count, 1)
+        sleep.assert_not_awaited()
+
     async def test_token_expiration_accepts_z_timezone(self):
         self.sync._execute_query = AsyncMock(return_value={
             "whoami": {"expires": "2099-01-01T00:00:00Z"},
@@ -193,8 +218,26 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.sync.rconn.get("task-1"))
         self.assertIsNotNone(self.sync.rconn.hget(self.sync.tag_retry_data_key, "77"))
 
+    async def test_model_not_found_update_reconciles_instead_of_retrying_forever(self):
+        self.sync._mythic_task_to_ghostwriter_message = AsyncMock(return_value={
+            "entry_identifier": "task-1",
+            "oplog": "12",
+            "tags": [],
+        })
+        self.sync._execute_query = AsyncMock(side_effect=[
+            model_not_found_error(),
+            {"oplogEntry": [{"id": "99"}]},
+            {"update_oplogEntry": {"returning": [{"id": "99"}]}},
+        ])
+
+        await self.sync._update_entry({"agent_task_id": "task-1", "id": "mythic-row"}, "41")
+
+        first_call = self.sync._execute_query.await_args_list[0]
+        self.assertFalse(first_call.kwargs["retry_model_not_found"])
+        self.assertEqual(self.sync.rconn.get(self.sync._redis_entry_key("task-1")), b"99")
+
     async def test_failed_tag_update_remains_queued_without_blocking_entry(self):
-        self.sync._queue_task_tags(["mythic:test"], "99")
+        self.sync._queue_task_tags(["mythic:test"], "99", "task-1")
         self.sync._handle_task_tags = AsyncMock(side_effect=RuntimeError("temporary failure"))
 
         with patch("sync.random.uniform", return_value=10):
@@ -206,13 +249,56 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("99", self.sync.rconn.sorted_sets[self.sync.tag_retry_schedule_key])
 
     async def test_successful_tag_update_is_removed_from_queue(self):
-        self.sync._queue_task_tags(["mythic:test"], "99")
+        self.sync._queue_task_tags(["mythic:test"], "99", "task-1")
         self.sync._handle_task_tags = AsyncMock()
 
         await self.sync._process_pending_tag_update("99")
 
         self.assertIsNone(self.sync.rconn.hget(self.sync.tag_retry_data_key, "99"))
         self.assertNotIn("99", self.sync.rconn.sorted_sets[self.sync.tag_retry_schedule_key])
+
+    async def test_completed_tag_job_does_not_remove_newer_payload(self):
+        self.sync._queue_task_tags(["mythic:old"], "99", "task-1")
+
+        async def replace_with_newer_payload(*args, **kwargs):
+            self.sync._queue_task_tags(["mythic:new"], "99", "task-1")
+
+        self.sync._handle_task_tags = AsyncMock(side_effect=replace_with_newer_payload)
+
+        await self.sync._process_pending_tag_update("99")
+
+        payload = self.sync.rconn.hget(self.sync.tag_retry_data_key, "99")
+        self.assertIn(b'"mythic:new"', payload)
+        self.assertIn("99", self.sync.rconn.sorted_sets[self.sync.tag_retry_schedule_key])
+
+    async def test_missing_tag_target_moves_to_current_entry(self):
+        self.sync._queue_task_tags(["mythic:test"], "41", "task-1")
+        self.sync._handle_task_tags = AsyncMock(side_effect=model_not_found_error())
+        self.sync._execute_query = AsyncMock(return_value={"oplogEntry": [{"id": "99"}]})
+
+        await self.sync._process_pending_tag_update("41")
+
+        self.assertIsNone(self.sync.rconn.hget(self.sync.tag_retry_data_key, "41"))
+        payload = self.sync.rconn.hget(self.sync.tag_retry_data_key, "99")
+        self.assertIn(b'"entry_id": "99"', payload)
+        self.assertEqual(self.sync.rconn.get(self.sync._redis_entry_key("task-1")), b"99")
+
+    async def test_deleted_tag_target_is_retired_instead_of_retried_forever(self):
+        self.sync._queue_task_tags(["mythic:test"], "41", "task-1")
+        self.sync._handle_task_tags = AsyncMock(side_effect=model_not_found_error())
+        self.sync._execute_query = AsyncMock(return_value={"oplogEntry": []})
+
+        await self.sync._process_pending_tag_update("41")
+
+        self.assertIsNone(self.sync.rconn.hget(self.sync.tag_retry_data_key, "41"))
+        self.assertNotIn("41", self.sync.rconn.sorted_sets[self.sync.tag_retry_schedule_key])
+        dead_letter = self.sync.rconn.hget(self.sync.tag_retry_dead_letter_key, "41")
+        self.assertIn(b'"entry_identifier": "task-1"', dead_letter)
+        self.assertIn(b'"reason": "entry identifier no longer resolves in Ghostwriter"', dead_letter)
+        self.assertEqual(
+            self.sync._post_error_notification.await_args.kwargs["source"],
+            "mythic_sync_orphaned_tag_update",
+        )
 
     def test_legacy_redis_mapping_is_migrated_to_scoped_key(self):
         self.sync.rconn.set("task-1", "41")
@@ -274,6 +360,51 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(self.sync.rconn, redis_connection)
         self.assertEqual(redis_client.call_args.kwargs["db"], self.sync.REDIS_DB)
+
+    async def test_redis_startup_warns_about_embedded_storage_and_dead_letters(self):
+        redis_connection = FakeRedis()
+        redis_connection.hset(
+            self.sync.tag_retry_dead_letter_key,
+            "41",
+            '{"entry_identifier": "task-1", "reason": "deleted"}',
+        )
+        self.sync.REDIS_HOSTNAME = "127.0.0.1"
+
+        with patch("sync.redis.Redis", return_value=redis_connection), self.assertLogs(
+                "mythic_sync_logger", level="WARNING"
+        ) as logs:
+            await self.sync._wait_for_redis()
+
+        output = "\n".join(logs.output)
+        self.assertIn("mount stable persistent storage at /data", output)
+        self.assertIn(self.sync.tag_retry_dead_letter_key, output)
+        self.assertIn("inspect with HGETALL", output)
+
+    async def test_redis_url_supports_credentials_without_logging_them(self):
+        redis_connection = FakeRedis()
+        self.sync.REDIS_URL = "rediss://sync-user:secret-password@redis.example:6380/4"
+
+        with patch("sync.redis.Redis.from_url", return_value=redis_connection) as from_url, self.assertLogs(
+                "mythic_sync_logger", level="INFO"
+        ) as logs:
+            await self.sync._wait_for_redis()
+
+        from_url.assert_called_once_with(
+            self.sync.REDIS_URL,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+        )
+        output = "\n".join(logs.output)
+        self.assertIn("configured REDIS_URL", output)
+        self.assertNotIn("secret-password", output)
+
+    async def test_error_notification_is_skipped_before_mythic_authentication(self):
+        self.sync.mythic_instance = None
+
+        with patch("sync.mythic.send_event_log_message", new=AsyncMock()) as send_message:
+            await MythicSync._post_error_notification(self.sync, message="Redis unavailable")
+
+        send_message.assert_not_awaited()
 
     async def test_create_entry_propagates_unexpected_failures(self):
         self.sync._mythic_task_to_ghostwriter_message = AsyncMock(return_value={

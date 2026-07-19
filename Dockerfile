@@ -15,6 +15,8 @@ RUN chmod +x /app/docker-entrypoint.sh
 
 VOLUME ["/data"]
 
+STOPSIGNAL SIGTERM
+
 USER redis
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

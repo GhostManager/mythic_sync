@@ -13,13 +13,14 @@ services:
         restart: unless-stopped
     redis:
         image: redis:7-alpine
-        command: ["redis-server", "--appendonly", "yes"]
+        command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
         healthcheck:
             test: ["CMD", "redis-cli", "ping"]
             interval: 5s
             timeout: 3s
             retries: 10
         restart: unless-stopped
+        stop_grace_period: 30s
         volumes:
             - mythic_sync_redis:/data
 
