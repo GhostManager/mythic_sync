@@ -293,14 +293,30 @@ class MythicSync:
             raise ValueError(f"Unsupported Mythic IP value: {source_ips!r}")
 
         addresses = set()
+        omitted_addresses = 0
         for source_ip in source_ips:
             source_ip = str(source_ip).strip()
             if not source_ip:
                 continue
             try:
-                addresses.add(ipaddress.ip_address(source_ip.split("/", 1)[0]))
+                address = ipaddress.ip_address(source_ip.split("/", 1)[0])
+                if (
+                        address.is_loopback
+                        or address.is_unspecified
+                        or address.is_multicast
+                        or (address.version == 6 and address.is_link_local)
+                ):
+                    omitted_addresses += 1
+                    continue
+                addresses.add(address)
             except ValueError:
                 mythic_sync_log.warning("Ignoring invalid IP address reported by Mythic: %r", source_ip)
+
+        if omitted_addresses:
+            mythic_sync_log.debug(
+                "Omitted %s loopback, unspecified, multicast, or IPv6 link-local address(es) reported by Mythic",
+                omitted_addresses,
+            )
 
         return ", ".join(
             str(address) for address in sorted(addresses, key=lambda address: (address.version, int(address)))

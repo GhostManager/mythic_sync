@@ -120,6 +120,28 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_sorted_ips_accepts_a_single_plain_ip(self):
         self.assertEqual(await self.sync._get_sorted_ips("10.0.0.1/24"), "10.0.0.1")
 
+    async def test_get_sorted_ips_omits_low_value_adapter_addresses(self):
+        result = await self.sync._get_sorted_ips([
+            "10.10.14.4",
+            "100.76.103.80",
+            "172.17.0.1",
+            "172.18.0.1",
+            "192.168.3.150",
+            "dead:beef:2::1002",
+            "fd7a:115c:a1e0::1437:6753",
+            "fe80::1caf:f2ff:fe76:822",
+            "fe80::598e:5d6:f491:e319",
+            "127.0.0.1",
+            "::",
+            "ff02::1",
+        ])
+
+        self.assertEqual(
+            result,
+            "10.10.14.4, 100.76.103.80, 172.17.0.1, 172.18.0.1, 192.168.3.150, "
+            "dead:beef:2::1002, fd7a:115c:a1e0::1437:6753",
+        )
+
     def test_parse_mythic_timestamp_accepts_common_variants(self):
         self.assertEqual(
             self.sync._parse_mythic_timestamp("2026-07-18T12:34:56Z"),

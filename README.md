@@ -115,6 +115,11 @@ Ensure the host where `mythic_sync` is running has network access to the Ghostwr
 `mythic_sync` uses Redis to track events already sent to Ghostwriter and to retain pending tag
 updates. Redis mappings are scoped by Mythic server and Ghostwriter oplog. Legacy mappings and
 pending tag jobs are migrated automatically when first accessed after an upgrade.
+
+Source IP normalization removes duplicate, loopback, unspecified, multicast, and IPv6 link-local
+addresses to keep multi-adapter hosts readable. Private IPv4, CGNAT, IPv6 ULA, and globally routable
+addresses are preserved because interface metadata is not available to identify container bridges
+reliably.
 If a queued tag job's entry no longer resolves by `entryIdentifier`, the worker removes it from
 active retries but preserves its payload in the deployment's namespaced Redis dead-letter hash and
 notifies Mythic. A later task update can create a fresh tag job for the current entry.

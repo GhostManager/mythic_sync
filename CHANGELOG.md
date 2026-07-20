@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Changed Redis AOF flushing to `appendfsync always` and added graceful embedded Redis shutdown handling.
 * Updated supported dependency pins and moved the production container to Python 3.11 on Debian Bookworm.
 * Made Mythic timestamp and IP parsing tolerant of timezone variants, IPv6, plain strings, CIDR notation, and malformed individual addresses.
+* Filtered loopback, unspecified, multicast, and IPv6 link-local source addresses while preserving potentially useful private, CGNAT, ULA, and global addresses.
 * Limited GraphQL error context to identifiers while redacting commands, comments, and other potentially sensitive values.
 * Made the Ghostwriter initialization entry idempotent and corrected Mythic API-key authentication so user credentials are not also required.
 * Made subscription and tag worker shutdown explicit so worker failures cancel and await the remaining tasks before the Ghostwriter client closes.
