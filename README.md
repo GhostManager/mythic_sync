@@ -36,6 +36,7 @@ For the easiest experience with `mythic_sync`, install it via the `mythic-cli` t
 On your Mythic server, run: `sudo ./mythic-cli mythic_sync install github https://github.com/GhostManager/mythic_sync`
 
 Follow the prompts to configure `mythic_sync` with your Mythic and Ghostwriter server configuration.
+If `MYTHIC_PORT` is not provided, `mythic_sync` uses Mythic's default HTTPS port, `7443`.
 
 You can get your Ghostwriter Oplog ID by visiting your log in your web browser and looking at the top of the page or the URL. A URL with `/oplog/12/entries` means your Oplog ID is `12`.
 
@@ -73,7 +74,7 @@ REDIS_DB=1
 ```
 
 Set `MYTHIC_API_KEY` to authenticate with a Mythic API key instead of `MYTHIC_USERNAME` and
-`MYTHIC_PASSWORD`.
+`MYTHIC_PASSWORD`. `MYTHIC_PORT` is optional and defaults to `7443`.
 
 The standalone Compose deployment stores entry mappings and pending tag updates in the named
 `mythic_sync_redis` volume. Redis append-only persistence with `appendfsync always` is enabled so recreating the
@@ -102,7 +103,7 @@ docker-compose up
 
 Open your Ghostwriter log and look for an initial entry. You should see something like the following:
 
-    > Initial entry from mythic_sync at: <server_ip>. If you're seeing this then oplog syncing is working for this C2 server!
+    > Initial entry from mythic_sync at: <server_ip>:<server_port>. If you're seeing this then oplog syncing is working for this C2 server!
 
 If so, you're all set! Otherwise, check the logs from the docker container for error messages. Fetch the logs with:
 
@@ -113,8 +114,10 @@ If so, you're all set! Otherwise, check the logs from the docker container for e
 Ensure the host where `mythic_sync` is running has network access to the Ghostwriter and Mythic servers.
 
 `mythic_sync` uses Redis to track events already sent to Ghostwriter and to retain pending tag
-updates. Redis mappings are scoped by Mythic server and Ghostwriter oplog. Legacy mappings and
-pending tag jobs are migrated automatically when first accessed after an upgrade.
+updates. Redis mappings are scoped by Mythic host, Mythic port, and Ghostwriter oplog. Legacy
+mappings and pending tag jobs are migrated automatically when first accessed after an upgrade.
+Migration from the earlier IP-only namespace assumes the old state belongs to the first upgraded
+instance; state that was already mixed by multiple Mythic ports cannot be separated automatically.
 
 Source IP normalization removes duplicate, loopback, unspecified, multicast, and IPv6 link-local
 addresses to keep multi-adapter hosts readable. Private IPv4, CGNAT, IPv6 ULA, and globally routable
@@ -127,14 +130,14 @@ notifies Mythic. A later task update can create a fresh tag job for the current 
 The dead-letter hash is named:
 
 ```text
-mythic_sync:<oplog-id>:<mythic-host>:pending_tag_updates:dead_letter
+mythic_sync:<oplog-id>:<mythic-host>:<mythic-port>:pending_tag_updates:dead_letter
 ```
 
 The startup warning prints the exact key. For the standalone Compose deployment, inspect it with:
 
 ```bash
 docker compose exec redis redis-cli -n 1 HGETALL \
-  "mythic_sync:<oplog-id>:<mythic-host>:pending_tag_updates:dead_letter"
+  "mythic_sync:<oplog-id>:<mythic-host>:<mythic-port>:pending_tag_updates:dead_letter"
 ```
 
 After investigating an individual job, remove only that field with `HDEL <hash-key> <entry-id>`.
@@ -149,7 +152,7 @@ At startup, the service logs the selected Redis endpoint and number of pending t
 successful Redis client construction is not sufficient: the service waits for `PING` to succeed
 before subscribing to Mythic events.
 
-Run only one `mythic_sync` instance for a given Mythic server and Ghostwriter oplog namespace.
+Run only one `mythic_sync` instance for a given Mythic host, port, and Ghostwriter oplog namespace.
 This release does not coordinate tag workers across multiple active replicas.
 
 ### Manual Acceptance Checklist

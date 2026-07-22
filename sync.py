@@ -205,12 +205,7 @@ class MythicSync:
         mythic_sync_log.error("MYTHIC_IP must be supplied!")
         sys.exit(1)
 
-    MYTHIC_PORT = os.environ.get("MYTHIC_PORT")
-    if MYTHIC_PORT is None:
-        mythic_sync_log.error("MYTHIC_PORT must be supplied!")
-        sys.exit(1)
-    else:
-        MYTHIC_PORT = int(MYTHIC_PORT)
+    MYTHIC_PORT = int(os.environ.get("MYTHIC_PORT") or "7443")
 
     MYTHIC_URL = f"https://{MYTHIC_IP}:{MYTHIC_PORT}"
 
@@ -251,10 +246,20 @@ class MythicSync:
 
     def __init__(self):
         self._notification_timestamps = {}
-        self.redis_namespace = f"mythic_sync:{self.GHOSTWRITER_OPLOG_ID}:{self.MYTHIC_IP}"
+        self.legacy_ip_redis_namespace = f"mythic_sync:{self.GHOSTWRITER_OPLOG_ID}:{self.MYTHIC_IP}"
+        self.redis_namespace = f"{self.legacy_ip_redis_namespace}:{self.MYTHIC_PORT}"
         self.tag_retry_data_key = f"{self.redis_namespace}:pending_tag_updates:data"
         self.tag_retry_schedule_key = f"{self.redis_namespace}:pending_tag_updates:schedule"
         self.tag_retry_dead_letter_key = f"{self.redis_namespace}:pending_tag_updates:dead_letter"
+        self.legacy_ip_tag_retry_data_key = (
+            f"{self.legacy_ip_redis_namespace}:pending_tag_updates:data"
+        )
+        self.legacy_ip_tag_retry_schedule_key = (
+            f"{self.legacy_ip_redis_namespace}:pending_tag_updates:schedule"
+        )
+        self.legacy_ip_tag_retry_dead_letter_key = (
+            f"{self.legacy_ip_redis_namespace}:pending_tag_updates:dead_letter"
+        )
 
     async def initialize(self) -> None:
         """
@@ -334,6 +339,10 @@ class MythicSync:
         """Return a Redis mapping key scoped to this Mythic server and Ghostwriter oplog."""
         return f"{self.redis_namespace}:entry:{entry_identifier}"
 
+    def _legacy_ip_redis_entry_key(self, entry_identifier: str) -> str:
+        """Return the pre-port mapping key used by earlier 3.1.0 builds."""
+        return f"{self.legacy_ip_redis_namespace}:entry:{entry_identifier}"
+
     def _get_cached_entry_id(self, entry_identifier: str):
         """Read a scoped entry mapping, migrating the legacy raw key when encountered."""
         scoped_key = self._redis_entry_key(entry_identifier)
@@ -341,14 +350,19 @@ class MythicSync:
         if entry_id is not None:
             return entry_id
 
-        legacy_entry_id = self.rconn.get(entry_identifier)
-        if legacy_entry_id is not None:
-            pipeline = self.rconn.pipeline(transaction=True)
-            pipeline.set(scoped_key, legacy_entry_id)
-            pipeline.delete(entry_identifier)
-            pipeline.execute()
-            mythic_sync_log.info("Migrated legacy Redis mapping for %s", entry_identifier)
-        return legacy_entry_id
+        for legacy_key in (
+                self._legacy_ip_redis_entry_key(entry_identifier),
+                entry_identifier,
+        ):
+            legacy_entry_id = self.rconn.get(legacy_key)
+            if legacy_entry_id is not None:
+                pipeline = self.rconn.pipeline(transaction=True)
+                pipeline.set(scoped_key, legacy_entry_id)
+                pipeline.delete(legacy_key)
+                pipeline.execute()
+                mythic_sync_log.info("Migrated legacy Redis mapping for %s", entry_identifier)
+                return legacy_entry_id
+        return None
 
     def _set_cached_entry_id(self, entry_identifier: str, ghostwriter_entry_id: str) -> None:
         self.rconn.set(self._redis_entry_key(entry_identifier), ghostwriter_entry_id)
@@ -356,30 +370,68 @@ class MythicSync:
     def _delete_cached_entry_id(self, entry_identifier: str) -> None:
         pipeline = self.rconn.pipeline(transaction=True)
         pipeline.delete(self._redis_entry_key(entry_identifier))
+        pipeline.delete(self._legacy_ip_redis_entry_key(entry_identifier))
         pipeline.delete(entry_identifier)
         pipeline.execute()
 
-    def _migrate_legacy_tag_queue(self) -> int:
-        """Move pre-namespace pending tag jobs into this deployment's scoped queue."""
-        legacy_payloads = self.rconn.hgetall(self.legacy_tag_retry_data_key)
-        if not legacy_payloads:
-            return 0
-
+    def _migrate_tag_queue(self, data_key: str, schedule_key: str) -> int:
+        """Move one legacy pending-tag queue into the current port-scoped queue."""
+        legacy_payloads = self.rconn.hgetall(data_key)
         legacy_schedule = dict(
-            self.rconn.zrange(self.legacy_tag_retry_schedule_key, 0, -1, withscores=True)
+            self.rconn.zrange(schedule_key, 0, -1, withscores=True)
         )
         pipeline = self.rconn.pipeline(transaction=True)
+        migrated = 0
         for entry_id, payload in legacy_payloads.items():
-            pipeline.hset(self.tag_retry_data_key, entry_id, payload)
-            pipeline.zadd(
-                self.tag_retry_schedule_key,
-                {entry_id: legacy_schedule.get(entry_id, time.time())},
-            )
-        pipeline.delete(self.legacy_tag_retry_data_key)
-        pipeline.delete(self.legacy_tag_retry_schedule_key)
+            if self.rconn.hget(self.tag_retry_data_key, entry_id) is None:
+                pipeline.hset(self.tag_retry_data_key, entry_id, payload)
+                pipeline.zadd(
+                    self.tag_retry_schedule_key,
+                    {entry_id: legacy_schedule.get(entry_id, time.time())},
+                )
+                migrated += 1
+        pipeline.delete(data_key)
+        pipeline.delete(schedule_key)
         pipeline.execute()
-        mythic_sync_log.info("Migrated %s legacy pending tag update(s)", len(legacy_payloads))
-        return len(legacy_payloads)
+        return migrated
+
+    def _migrate_dead_letters(self, dead_letter_key: str) -> int:
+        """Move one legacy dead-letter hash into the current port-scoped hash."""
+        legacy_payloads = self.rconn.hgetall(dead_letter_key)
+        pipeline = self.rconn.pipeline(transaction=True)
+        migrated = 0
+        for entry_id, payload in legacy_payloads.items():
+            if self.rconn.hget(self.tag_retry_dead_letter_key, entry_id) is None:
+                pipeline.hset(self.tag_retry_dead_letter_key, entry_id, payload)
+                migrated += 1
+        pipeline.delete(dead_letter_key)
+        pipeline.execute()
+        return migrated
+
+    def _migrate_legacy_tag_queue(self) -> int:
+        """Move pre-namespace and pre-port tag state into this deployment's scoped keys."""
+        migrated = self._migrate_tag_queue(
+            self.legacy_tag_retry_data_key,
+            self.legacy_tag_retry_schedule_key,
+        )
+
+        ip_scoped_count = self.rconn.hlen(self.legacy_ip_tag_retry_data_key)
+        ip_scoped_dead_letters = self.rconn.hlen(self.legacy_ip_tag_retry_dead_letter_key)
+        if ip_scoped_count or ip_scoped_dead_letters:
+            mythic_sync_log.warning(
+                "Migrating %s IP-only Redis tag record(s) to Mythic port %s; pre-port state cannot be "
+                "separated if multiple Mythic instances previously shared this IP and oplog",
+                ip_scoped_count + ip_scoped_dead_letters,
+                self.MYTHIC_PORT,
+            )
+        migrated += self._migrate_tag_queue(
+            self.legacy_ip_tag_retry_data_key,
+            self.legacy_ip_tag_retry_schedule_key,
+        )
+        migrated += self._migrate_dead_letters(self.legacy_ip_tag_retry_dead_letter_key)
+        if migrated:
+            mythic_sync_log.info("Migrated %s legacy pending or dead-lettered tag update(s)", migrated)
+        return migrated
 
     @staticmethod
     def _get_query_context(query: DocumentNode, variable_values: dict = None) -> tuple[str, str]:
@@ -560,7 +612,7 @@ class MythicSync:
     async def _create_initial_entry(self) -> None:
         """Send one idempotent initialization entry to Ghostwriter's oplog."""
         mythic_sync_log.info("Sending the initial Ghostwriter log entry")
-        entry_identifier = f"mythic_sync:initial:{self.MYTHIC_IP}"
+        entry_identifier = f"mythic_sync:initial:{self.MYTHIC_IP}:{self.MYTHIC_PORT}"
         existing_entry = await self._execute_query(
             self.entry_identifier_query,
             {
@@ -570,15 +622,17 @@ class MythicSync:
         )
         if existing_entry.get("oplogEntry", []):
             mythic_sync_log.info(
-                "Ghostwriter initialization entry already exists for Mythic server %s",
+                "Ghostwriter initialization entry already exists for Mythic server %s:%s",
                 self.MYTHIC_IP,
+                self.MYTHIC_PORT,
             )
         else:
             variable_values = {
                 "oplogId": self.GHOSTWRITER_OPLOG_ID,
-                "description": f"Initial entry from mythic_sync at: {self.MYTHIC_IP}. If you're seeing this then "
+                "description": f"Initial entry from mythic_sync at: {self.MYTHIC_IP}:{self.MYTHIC_PORT}. "
+                               "If you're seeing this then "
                                "oplog syncing is working for this C2 server!",
-                "server": f"Mythic Server ({self.MYTHIC_IP})",
+                "server": f"Mythic Server ({self.MYTHIC_IP}:{self.MYTHIC_PORT})",
                 "entry_identifier": entry_identifier,
                 "extraFields": {},
             }

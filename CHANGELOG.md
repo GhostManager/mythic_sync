@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Changed Ghostwriter GraphQL retries to use exponential backoff with jitter, capped at five minutes.
 * Improved GraphQL error messages with the operation name and variables, including actionable context for ambiguous `ModelDoesNotExist` responses.
 * Changed source IP formatting from a JSON array to a sorted, comma-separated string.
-* Made Redis hostname, port, and database configurable and scoped Redis mappings by Mythic server and Ghostwriter oplog.
+* Made Redis hostname, port, and database configurable and scoped Redis mappings by Mythic host, Mythic port, and Ghostwriter oplog.
+* Made `MYTHIC_PORT` optional and defaulted it to Mythic's standard HTTPS port, `7443`, preserving existing install behavior.
 * Enabled Redis append-only persistence for embedded Mythic deployments and for the standalone Compose Redis service with a named volume. Raw Mythic subscription events remain live-streamed and are not persisted locally.
 * Changed Redis AOF flushing to `appendfsync always` and added graceful embedded Redis shutdown handling.
 * Updated supported dependency pins and moved the production container to Python 3.11 on Debian Bookworm.
@@ -44,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Fixed Redis startup checks reporting success without issuing a command.
 * Prevented Redis startup failures from attempting Mythic notifications before Mythic authentication is established.
 * Ensured task cancellation exits Redis, service, authentication, GraphQL, and tag retry loops instead of being handled as a retryable failure.
+* Prevented Mythic instances sharing an IP but using different ports from colliding in Redis state or initialization entry identifiers; existing IP-only Redis state migrates on startup.
 * Fixed conversion, creation, update, and Redis failures being swallowed after logging, which could allow processing to continue after an entry failed.
 * Fixed timezone-aware token expiration parsing for timestamps ending in `Z`.
 

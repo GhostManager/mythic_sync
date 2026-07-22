@@ -1,5 +1,7 @@
 import asyncio
 import os
+import subprocess
+import sys
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -110,6 +112,31 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
         self.sync.REDIS_URL = ""
         self.sync.rconn = FakeRedis()
         self.sync._post_error_notification = AsyncMock()
+
+    def test_redis_namespace_includes_mythic_port(self):
+        self.assertEqual(
+            self.sync.redis_namespace,
+            f"mythic_sync:{self.sync.GHOSTWRITER_OPLOG_ID}:{self.sync.MYTHIC_IP}:{self.sync.MYTHIC_PORT}",
+        )
+
+    def test_mythic_port_defaults_to_7443_when_omitted(self):
+        environment = os.environ.copy()
+        environment.pop("MYTHIC_PORT", None)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from sync import MythicSync; print(MythicSync.MYTHIC_PORT)",
+            ],
+            cwd=os.path.dirname(__file__),
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        self.assertEqual(result.stdout.strip(), "7443")
 
     async def test_get_sorted_ips_returns_plain_sorted_string(self):
         result = await self.sync._get_sorted_ips(
@@ -332,6 +359,16 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.sync.rconn.get("task-1"))
         self.assertEqual(self.sync.rconn.get(self.sync._redis_entry_key("task-1")), b"41")
 
+    def test_ip_only_redis_mapping_is_migrated_to_port_scoped_key(self):
+        legacy_key = self.sync._legacy_ip_redis_entry_key("task-1")
+        self.sync.rconn.set(legacy_key, "41")
+
+        entry_id = self.sync._get_cached_entry_id("task-1")
+
+        self.assertEqual(entry_id, b"41")
+        self.assertIsNone(self.sync.rconn.get(legacy_key))
+        self.assertEqual(self.sync.rconn.get(self.sync._redis_entry_key("task-1")), b"41")
+
     def test_legacy_tag_queue_is_migrated_to_scoped_keys(self):
         self.sync.rconn.hset(
             self.sync.legacy_tag_retry_data_key,
@@ -347,6 +384,28 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sync.rconn.sorted_sets[self.sync.tag_retry_schedule_key]["99"], 123.0)
         self.assertEqual(self.sync.rconn.hlen(self.sync.legacy_tag_retry_data_key), 0)
 
+    def test_ip_only_tag_and_dead_letter_state_is_migrated_to_port_scope(self):
+        self.sync.rconn.hset(
+            self.sync.legacy_ip_tag_retry_data_key,
+            "99",
+            '{"attempt": 1, "entry_id": "99", "entry_identifier": "task-1", "tags": []}',
+        )
+        self.sync.rconn.zadd(self.sync.legacy_ip_tag_retry_schedule_key, {"99": 123.0})
+        self.sync.rconn.hset(
+            self.sync.legacy_ip_tag_retry_dead_letter_key,
+            "41",
+            '{"entry_id": "41", "entry_identifier": "task-2", "reason": "deleted"}',
+        )
+
+        migrated = self.sync._migrate_legacy_tag_queue()
+
+        self.assertEqual(migrated, 2)
+        self.assertIsNotNone(self.sync.rconn.hget(self.sync.tag_retry_data_key, "99"))
+        self.assertEqual(self.sync.rconn.sorted_sets[self.sync.tag_retry_schedule_key]["99"], 123.0)
+        self.assertIsNotNone(self.sync.rconn.hget(self.sync.tag_retry_dead_letter_key, "41"))
+        self.assertEqual(self.sync.rconn.hlen(self.sync.legacy_ip_tag_retry_data_key), 0)
+        self.assertEqual(self.sync.rconn.hlen(self.sync.legacy_ip_tag_retry_dead_letter_key), 0)
+
     async def test_initial_entry_is_not_duplicated(self):
         self.sync._execute_query = AsyncMock(return_value={"oplogEntry": [{"id": "1"}]})
 
@@ -357,7 +416,9 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
             self.sync.entry_identifier_query,
             {
                 "oplog": self.sync.GHOSTWRITER_OPLOG_ID,
-                "entry_identifier": f"mythic_sync:initial:{self.sync.MYTHIC_IP}",
+                "entry_identifier": (
+                    f"mythic_sync:initial:{self.sync.MYTHIC_IP}:{self.sync.MYTHIC_PORT}"
+                ),
             },
         )
 
