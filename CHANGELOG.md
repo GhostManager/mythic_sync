@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Prevented Redis startup failures from attempting Mythic notifications before Mythic authentication is established.
 * Ensured task cancellation exits Redis, service, authentication, GraphQL, and tag retry loops instead of being handled as a retryable failure.
 * Prevented Mythic instances sharing an IP but using different ports from colliding in Redis state or initialization entry identifiers; existing IP-only Redis state migrates on startup.
+* Stopped the standalone Compose file from overriding Redis host, port, and database values supplied through `settings.env`.
 * Fixed conversion, creation, update, and Redis failures being swallowed after logging, which could allow processing to continue after an entry failed.
 * Fixed timezone-aware token expiration parsing for timestamps ending in `Z`.
 

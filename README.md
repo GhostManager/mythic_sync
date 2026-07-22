@@ -73,6 +73,10 @@ REDIS_PORT=6379
 REDIS_DB=1
 ```
 
+The standalone Compose deployment reads these Redis settings directly from `settings.env`; edit
+that file to select a different Redis host, port, or database without modifying
+`docker-compose.yml`.
+
 Set `MYTHIC_API_KEY` to authenticate with a Mythic API key instead of `MYTHIC_USERNAME` and
 `MYTHIC_PASSWORD`. `MYTHIC_PORT` is optional and defaults to `7443`.
 
