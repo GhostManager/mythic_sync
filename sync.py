@@ -976,6 +976,8 @@ class MythicSync:
                     "Message has no `agent_task_id` or `agent_callback_id`; received keys: "
                     f"{sorted(message)}"
                 )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             mythic_sync_log.exception("Failed to convert Mythic event %s for Ghostwriter", entry_id or "unknown")
             await self._post_error_notification(source="mythic_sync_conversion")
@@ -1007,6 +1009,8 @@ class MythicSync:
                         "Ghostwriter did not return an inserted oplog entry ID. Response: %s" %
                         result
                     )
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 mythic_sync_log.exception(
                     "Encountered an exception while trying to create a new log entry! Response from Ghostwriter: %s",
@@ -1030,6 +1034,8 @@ class MythicSync:
         mythic_sync_log.debug(f"Updating task: {message['agent_task_id']} - {message['id']} : {entry_id}")
         try:
             gw_message = await self._mythic_task_to_ghostwriter_message(message)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             mythic_sync_log.exception(
                 "Failed to convert Mythic task %s for a Ghostwriter update",
@@ -1097,6 +1103,8 @@ class MythicSync:
                 self._set_cached_entry_id(mythic_entry_id, ghostwriter_entry_id)
 
             self._queue_task_tags(tags, ghostwriter_entry_id, gw_message["entry_identifier"])
+        except asyncio.CancelledError:
+            raise
         except Exception:
             mythic_sync_log.exception("Exception encountered while trying to update task log entry in Ghostwriter!")
             await self._post_error_notification(source="mythic_sync_update_entry")
@@ -1147,6 +1155,8 @@ class MythicSync:
         ):
             try:
                 entry_id = self._get_cached_entry_id(data["agent_task_id"])
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 mythic_sync_log.exception(
                     "Encountered an exception while fetching the Redis mapping for Mythic task %s",

@@ -452,6 +452,16 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.sync._post_error_notification.assert_awaited_once()
 
+    async def test_create_entry_propagates_cancellation_without_notification(self):
+        self.sync._mythic_task_to_ghostwriter_message = AsyncMock(
+            side_effect=asyncio.CancelledError
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.sync._create_entry({"agent_task_id": "task-1"})
+
+        self.sync._post_error_notification.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()
