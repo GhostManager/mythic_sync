@@ -512,6 +512,8 @@ class MythicSync:
                 )
                 if not retry:
                     raise
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 mythic_sync_log.exception(
                     "Unexpected failure in Ghostwriter GraphQL operation '%s' with variables %s",
@@ -617,6 +619,8 @@ class MythicSync:
                                                 message=message,
                                                 source=notification_source,
                                                 level="warning")
+        except asyncio.CancelledError:
+            raise
         except Exception:
             mythic_sync_log.exception(
                 "Failed to submit Mythic notification from '%s'",
@@ -894,6 +898,8 @@ class MythicSync:
                 try:
                     await self._reconcile_pending_tag_update(entry_id, payload, payload_raw)
                     return
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
                     mythic_sync_log.exception(
                         "Failed to reconcile missing Ghostwriter entry %s for a pending tag update",
@@ -901,6 +907,8 @@ class MythicSync:
                     )
             self._reschedule_pending_tag_update(entry_id, payload, payload_raw)
             return
+        except asyncio.CancelledError:
+            raise
         except Exception:
             self._reschedule_pending_tag_update(entry_id, payload, payload_raw)
             return
@@ -925,6 +933,8 @@ class MythicSync:
                         entry_id = entry_id.decode()
                     await self._process_pending_tag_update(str(entry_id))
                     continue
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 mythic_sync_log.exception("Failed while processing pending Ghostwriter tag updates")
                 await self._post_error_notification(source="mythic_sync_tag_retry_worker")
@@ -1198,6 +1208,8 @@ class MythicSync:
                             )
                             await asyncio.sleep(self.wait_timeout)
                             continue
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 await asyncio.sleep(self.wait_timeout)
                 mythic_sync_log.warning("failed to connect to Mythic: %s", e)
@@ -1246,6 +1258,8 @@ class MythicSync:
                         self.tag_retry_dead_letter_key,
                     )
                 return
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 mythic_sync_log.exception(
                     "Encountered an exception while trying to connect to Redis at %s, trying again in %s seconds...",
@@ -1274,6 +1288,8 @@ class MythicSync:
                         ssl=True,
                     )
                     await mythic.get_me(mythic=mythic_instance)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     mythic_sync_log.error(
                         "Failed to authenticate with the Mythic API key: %s; trying again in %s seconds...",
@@ -1299,6 +1315,8 @@ class MythicSync:
                         server_port=self.MYTHIC_PORT,
                         ssl=True,
                         timeout=-1)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     mythic_sync_log.error(
                         "Encountered an exception while trying to authenticate to Mythic: %s; trying again in %s "
@@ -1310,6 +1328,8 @@ class MythicSync:
                     continue
                 try:
                     await mythic.get_me(mythic=mythic_instance)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     mythic_sync_log.error(
                         "Encountered an exception while trying to get user info from Mythic: %s; trying again in "
@@ -1334,6 +1354,8 @@ async def scripting():
         ]
         try:
             await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             mythic_sync_log.exception(
                 "Encountered an exception while subscribing to tasks and responses, restarting..."

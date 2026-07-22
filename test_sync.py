@@ -1,3 +1,4 @@
+import asyncio
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -382,6 +383,16 @@ class MythicSyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(self.sync.rconn, redis_connection)
         self.assertEqual(redis_client.call_args.kwargs["db"], self.sync.REDIS_DB)
+
+    async def test_wait_for_redis_propagates_cancellation_without_retrying(self):
+        with patch("sync.redis.Redis", side_effect=asyncio.CancelledError), patch(
+                "sync.asyncio.sleep", new_callable=AsyncMock
+        ) as sleep:
+            with self.assertRaises(asyncio.CancelledError):
+                await self.sync._wait_for_redis()
+
+        sleep.assert_not_awaited()
+        self.sync._post_error_notification.assert_not_awaited()
 
     async def test_redis_startup_warns_about_embedded_storage_and_dead_letters(self):
         redis_connection = FakeRedis()
