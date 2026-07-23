@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [3.1.0] - 18 July 2026
+
+### Added
+
+* Added an AOF-backed Redis retry queue so Ghostwriter tag failures do not block log entry ingestion and pending jobs survive `mythic_sync` restarts and service recreation, provided the Redis data volume is preserved.
+* Added Redis health checks, pending-job reporting, and automatic migration of legacy mappings and queued tag jobs.
+* Added tests for query retries, stale entry reconciliation, deleted entry recreation, tag retries, and source IP formatting.
+* Added a container-level CI check that verifies queued Redis data survives a Redis container restart.
+* Added startup warnings for embedded Redis volume requirements and actionable dead-letter inspection details.
+* Added optional `REDIS_URL` support for authenticated and TLS-protected external Redis services without logging URL credentials.
+* Added GitHub Actions coverage for Python 3.10, Python 3.12, and production container builds, plus Dependabot configuration.
+
+### Changed
+
+* Changed Ghostwriter GraphQL retries to use exponential backoff with jitter, capped at five minutes.
+* Improved GraphQL error messages with the operation name and variables, including actionable context for ambiguous `ModelDoesNotExist` responses.
+* Changed source IP formatting from a JSON array to a sorted, comma-separated string.
+* Made Redis hostname, port, and database configurable and scoped Redis mappings by Mythic host, Mythic port, and Ghostwriter oplog.
+* Made `MYTHIC_PORT` optional and defaulted it to Mythic's standard HTTPS port, `7443`, preserving existing install behavior.
+* Enabled Redis append-only persistence for embedded Mythic deployments and for the standalone Compose Redis service with a named volume. Raw Mythic subscription events remain live-streamed and are not persisted locally.
+* Changed Redis AOF flushing to `appendfsync always` and added graceful embedded Redis shutdown handling.
+* Updated supported dependency pins and moved the production container to Python 3.11 on Debian Bookworm.
+* Made Mythic timestamp and IP parsing tolerant of timezone variants, IPv6, plain strings, CIDR notation, and malformed individual addresses.
+* Filtered loopback, unspecified, multicast, and IPv6 link-local source addresses while preserving potentially useful private, CGNAT, ULA, and global addresses.
+* Limited GraphQL error context to identifiers while redacting commands, comments, and other potentially sensitive values.
+* Made the Ghostwriter initialization entry idempotent and corrected Mythic API-key authentication so user credentials are not also required.
+* Made subscription and tag worker shutdown explicit so worker failures cancel and await the remaining tasks before the Ghostwriter client closes.
+* Documented dead-letter inspection, the single-replica constraint, and a manual Mythic/Ghostwriter acceptance checklist.
+
+### Fixed
+
+* Fixed stale Redis entry mappings by looking up the Ghostwriter entry by `entryIdentifier` and repairing the mapping or recreating a deleted entry.
+* Fixed `ModelDoesNotExist` update failures retrying the same stale ID forever instead of reconciling by `entryIdentifier`.
+* Fixed pending tag jobs targeting deleted entries retrying forever; jobs now move to a replacement entry or enter a durable Redis dead-letter hash with an operator notification.
+* Prevented repeated Mythic error notifications and notification delivery failures from interfering with GraphQL retries.
+* Fixed Redis startup checks reporting success without issuing a command.
+* Prevented Redis startup failures from attempting Mythic notifications before Mythic authentication is established.
+* Ensured task cancellation exits Redis, service, authentication, GraphQL, and tag retry loops instead of being handled as a retryable failure.
+* Prevented Mythic instances sharing an IP but using different ports from colliding in Redis state or initialization entry identifiers; existing IP-only Redis state migrates on startup.
+* Stopped the standalone Compose file from overriding Redis host, port, and database values supplied through `settings.env`.
+* Fixed conversion, creation, update, and Redis failures being swallowed after logging, which could allow processing to continue after an entry failed.
+* Fixed timezone-aware token expiration parsing for timestamps ending in `Z`.
+
 ## [3.0.8] - 25 July 2025
 
 ### Changed

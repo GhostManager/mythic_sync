@@ -1,11 +1,22 @@
-FROM redis:7-bullseye
+FROM redis:7-bookworm
 
-RUN apt update && apt install python3 python3-pip -y  \
-    --no-install-recommends
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN python3 -m pip install -r requirements.txt
+WORKDIR /app
 
-COPY sync.py .
+COPY requirements.txt ./
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-CMD ["bash", "-c", "redis-server &  python3 -u sync.py"]
+COPY sync.py docker-entrypoint.sh ./
+RUN chmod +x /app/docker-entrypoint.sh
+
+VOLUME ["/data"]
+
+STOPSIGNAL SIGTERM
+
+USER redis
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
